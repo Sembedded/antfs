@@ -27,9 +27,57 @@
 #include <linux/slab.h>
 
 #include "misc.h"
-#include "cache.h"
 #include "dir.h"
 #include "reparse.h"
+
+/**
+ * Check if we are in the /FRITZ directory.
+ *
+ * @entry   dentry to check
+ *
+ * Returns @TRUE if the dentry is inside a folder named "FRITZ" in the disks
+ * root.
+ */
+static bool in_fritz_dir(struct dentry *entry)
+{
+	struct dentry *tmp_entry = entry;
+	struct dentry *prev_entry = NULL;
+
+	/* walk up */
+	while (tmp_entry->d_parent && tmp_entry->d_parent != tmp_entry) {
+		prev_entry = tmp_entry;
+		tmp_entry = tmp_entry->d_parent;
+	}
+
+	/* FRITZ dir? */
+	return prev_entry && !strcmp(prev_entry->d_name.name, "FRITZ");
+}
+
+/**
+ * create a link from @entry to the filesystem root
+ *
+ * @entry      dentry to check
+ * @mnt_point  result string
+ * @size       size of @mnt_point
+ *
+ * returns 0 on success and -EINVAL if @mnt_point is to small
+ */
+static int antfs_root_path(struct dentry *entry, char *mnt_point,
+				  size_t size)
+{
+	struct dentry *tmp_entry = entry->d_parent;
+
+	/* walk up */
+	while (tmp_entry->d_parent && tmp_entry->d_parent != tmp_entry) {
+		tmp_entry = tmp_entry->d_parent;
+		/* check if we still have enough space */
+		if (strlen(mnt_point) >= size - 4)
+			return -EINVAL;
+		strlcat(mnt_point, "../", size);
+	}
+
+	return 0;
+}
 
 /**
  *  @brief  antfs_lookup checks if an entry is kept inside a directory.
@@ -113,19 +161,37 @@ static struct dentry *antfs_lookup(struct inode *dir, struct dentry *entry,
 		inum = MREF(inum);
 		ni = ntfs_inode_open(sbi->vol, inum, fn);
 		if (IS_ERR(ni)) {
-			antfs_log_error("Cannot open inode %llu. "
-					"Deleting dentry.",
-					(unsigned long long)inum);
-			/* We have an orphaned dentry. Kill it with fire! */
-			err = ntfs_index_remove(dir_ni, NULL, fn,
-					(fn->file_name_length * 2) +
-					sizeof(*fn));
-			ntfs_inode_sync(dir_ni);
-			mutex_unlock(&dir_ni->ni_lock);
-			ntfs_free(fn);
-			if (err)
-				antfs_log_error("Removing orphaned index failed"
-						" with %d", err);
+			err = PTR_ERR(ni);
+			/* -ENOENT or -EIO should hint to permanent errors
+			 * on disk. -EIO could also mean we cannot access
+			 * physical media, but in this case there isn't
+			 * likely anything left we could damage.
+			 *
+			 * To be even more cautious, only delete stuff in
+			 * FRITZ directory.
+			 */
+			if ((err == -ENOENT || err == -EIO) &&
+					in_fritz_dir(entry)) {
+				antfs_log_error("Cannot open inode %llu, "
+						"err %d. Deleting dentry.",
+						(unsigned long long)inum, err);
+				/* We have an orphaned dentry.
+				 * Kill it with fire!
+				 */
+				err = ntfs_index_remove(dir_ni, NULL, fn,
+						(fn->file_name_length * 2) +
+						sizeof(*fn));
+				ntfs_inode_sync(dir_ni);
+				mutex_unlock(&dir_ni->ni_lock);
+				ntfs_free(fn);
+				if (err)
+					antfs_log_error("Removing orphaned "
+							"index failed with %d",
+							err);
+			} else {
+				mutex_unlock(&dir_ni->ni_lock);
+				ntfs_free(fn);
+			}
 		} else {
 			mutex_unlock(&dir_ni->ni_lock);
 			ntfs_free(fn);
@@ -218,8 +284,8 @@ static int antfs_create_i(struct inode *dir, struct dentry *entry, int mode)
 	ni = ntfs_create(dir_ni, securid, uname, uname_len, mode & S_IFMT);
 	mutex_unlock(&dir_ni->ni_lock);
 	if (IS_ERR(ni)) {
-		antfs_log_error("Could not aquire ni");
 		err = PTR_ERR(ni);
+		antfs_log_info("Could not acquire ni: err=%d", err);
 		goto free_name;
 	}
 
@@ -230,8 +296,6 @@ static int antfs_create_i(struct inode *dir, struct dentry *entry, int mode)
 
 	err = antfs_inode_init(inode);
 	if (err) {
-		int tmp_err;
-
 		antfs_log_error("Could not fetch VFS inode!");
 		/* - we have to rewind the allocated ni - */
 		if (mutex_lock_interruptible_nested(&ni->ni_lock,
@@ -245,8 +309,7 @@ static int antfs_create_i(struct inode *dir, struct dentry *entry, int mode)
 			err = -ERESTARTSYS;
 			goto free_name;
 		}
-		tmp_err = ntfs_unlink(dir_ni->vol, ni, dir_ni, uname,
-				uname_len);
+		ntfs_unlink(dir_ni->vol, ni, dir_ni, uname, uname_len);
 		mutex_unlock(&dir_ni->ni_lock);
 		mutex_unlock(&ni->ni_lock);
 
@@ -1184,15 +1247,10 @@ static const char *antfs_follow_link(struct dentry *dentry, void **cookie)
 static void *antfs_follow_link(struct dentry *dentry, struct nameidata *nd)
 #endif
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)
-	struct antfs_sb_info *sbi = ANTFS_SB(inode->i_sb);
-#else
-	struct antfs_sb_info *sbi = ANTFS_SB(dentry->d_inode->i_sb);
-#endif
 	struct ntfs_inode *ni = NULL;
 	struct ntfs_attr *na = NULL;
 	struct INTX_FILE *intx_file = NULL;
-	char *link = 0;
+	char *link = NULL;
 	int attr_size = 0;
 	int err = 0;
 	s64 br;
@@ -1217,17 +1275,16 @@ static void *antfs_follow_link(struct dentry *dentry, struct nameidata *nd)
 	 * the reparse point is defined by the drive letter which we can't use.
 	 */
 	if (ni->flags & FILE_ATTR_REPARSE_POINT) {
-		/* - check out antfs_set_mounpoint in case of problems - */
-		if (!sbi->mnt_point) {
-			err = antfs_set_mountpoint(sbi);
-			if (err	!= 0) {
-				antfs_log_error("Could not get mount point: %d",
-						err);
-				goto out;
-			}
+		char mnt_point[128] = {'\0'};
+
+		err = antfs_root_path(dentry, mnt_point,
+					  ARRAY_SIZE(mnt_point));
+		if (err) {
+			antfs_log_error("err: %d", err);
+			goto out;
 		}
 
-		link = ntfs_make_symlink(ni, sbi->mnt_point, &attr_size);
+		link = ntfs_make_symlink(ni, mnt_point, &attr_size);
 		if (!IS_ERR(link))
 			goto done;
 		/* - in case we fail to create a symlink we just ignore it - */
@@ -1350,7 +1407,8 @@ static const struct file_operations antfs_dir_operations = {
 	.fsync = antfs_fsync,
 };
 
-static const struct inode_operations antfs_symlink_inode_operations = {
+static const struct inode_operations antfs_symlink_inode_operations
+__maybe_unused = {
 	.setattr = antfs_setattr,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 5, 0)
 	.follow_link = antfs_follow_link,

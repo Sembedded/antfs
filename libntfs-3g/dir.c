@@ -35,7 +35,6 @@
 #include "index.h"
 #include "ntfstime.h"
 #include "lcnalloc.h"
-#include "cache.h"
 #include "misc.h"
 #include "reparse.h"
 #include "object_id.h"
@@ -403,6 +402,7 @@ descend_into_child_node:
 	return -ENOENT;
 put_err_out:
 	err = -EIO;
+	/* log? do we wanna know if a user has a corrupt dir? */
 	antfs_log_debug("Corrupt directory. Aborting lookup.");
 eo_put_err_out:
 	ntfs_attr_put_search_ctx(ctx);
@@ -609,7 +609,7 @@ enum INDEX_TYPE {
  *	Windows user may force patterns very similar to Interix,
  *	and most metadata files have such similar patters.
  */
-u32 ntfs_interix_types(struct ntfs_inode *ni)
+static u32 ntfs_interix_types(struct ntfs_inode *ni)
 {
 	u32 dt_type;
 	le64 magic;
@@ -823,6 +823,7 @@ static MFT_REF ntfs_mft_get_parent_ref(struct ntfs_inode *ni)
 				 le16_to_cpu(ctx->attr->value_offset));
 	if ((u8 *) fn + le32_to_cpu(ctx->attr->value_length) >
 	    (u8 *) ctx->attr + le32_to_cpu(ctx->attr->length)) {
+		/* log? do we want to know that corruption was here? */
 		antfs_log_error("Corrupt file name attribute in inode %lld.",
 				(unsigned long long)ni->mft_no);
 		goto io_err_out;
@@ -887,6 +888,7 @@ int ntfs_readdir(struct ntfs_inode *dir_ni, s64 *pos,
 	if (IS_ERR(ia_na)) {
 		err = PTR_ERR(ia_na);
 		if (err != -ENOENT) {
+			/* log? previously corrupted? */
 			antfs_log_error
 			    ("Failed to open index allocation attribute. "
 			     "Directory inode %lld is corrupt or bug",
@@ -1238,7 +1240,7 @@ static struct ntfs_inode *__ntfs_create(struct ntfs_inode *dir_ni, le32 securid,
 					const ntfschar *target, int target_len)
 {
 	struct ntfs_inode *ni;
-	int rollback_data = 0, rollback_sd = 0;
+	int rollback_data = 0;
 	struct FILE_NAME_ATTR *fn = NULL;
 	struct STANDARD_INFORMATION *si = NULL;
 	int err, tmp_err, fn_len, si_len;
@@ -1313,18 +1315,6 @@ static struct ntfs_inode *__ntfs_create(struct ntfs_inode *dir_ni, le32 securid,
 				"attribute.");
 		goto err_out;
 	}
-
-#if 0
-	/* TODO: Creates a security descriptor
-	 *       Insert again if needed!
-	 */
-	if (!securid) {
-		err = ntfs_sd_add_everyone(ni)
-		if (err != 0)
-			goto err_out;
-	}
-#endif
-	rollback_sd = 1;
 
 	if (S_ISDIR(type)) {
 		struct INDEX_ROOT *ir = NULL;
@@ -1459,17 +1449,16 @@ static struct ntfs_inode *__ntfs_create(struct ntfs_inode *dir_ni, le32 securid,
 	return ni;
 
 err_out:
-	if (rollback_sd)
-		ntfs_attr_remove(ni, AT_SECURITY_DESCRIPTOR, AT_UNNAMED, 0);
-
 	if (rollback_data)
 		ntfs_attr_remove(ni, AT_DATA, AT_UNNAMED, 0);
 
 	/* We never have extents in this stage. */
 	tmp_err = ntfs_mft_record_free(ni);
 	if (tmp_err != 0)
-		antfs_log_error("Failed to free MFT record.  "
-				"Leaving inconsistent metadata. Run chkdsk: %d",
+		antfs_logger(((struct antfs_sb_info *)
+				ANTFS_I(ni)->i_sb->s_fs_info)->logger,
+				"Failed to free MFT record. Leaving "
+				"inconsistent metadata. Run chkdsk: %d",
 				tmp_err);
 	{
 		struct inode *inode = ANTFS_I(ni);
@@ -1781,9 +1770,9 @@ int ntfs_inode_free(struct ntfs_inode *ni)
 			rl = ntfs_mapping_pairs_decompress(ni->vol, actx->attr,
 							   NULL);
 			if (IS_ERR(rl)) {
-				antfs_log_error
-				    ("Failed to decompress runlist.  "
-				     "Leaving inconsistent metadata.");
+				/* log? we don't know if we just did that */
+				antfs_log_error("Failed to decompress "
+				    "runlist. Leaving inconsistent metadata.");
 				continue;
 			}
 			if (ntfs_cluster_free_from_rl(ni->vol, rl)) {
@@ -1796,6 +1785,7 @@ int ntfs_inode_free(struct ntfs_inode *ni)
 		}
 	}
 	if (err != -ENOENT) {
+		/* log? do we corrupt or not? */
 		antfs_log_error("Attribute enumeration failed.  "
 				"Probably leaving inconsistent metadata.");
 	}
@@ -1805,8 +1795,10 @@ int ntfs_inode_free(struct ntfs_inode *ni)
 skip_free:
 	err = ntfs_mft_record_free(ni);
 	if (err != 0) {
-		antfs_log_error("Failed to free base MFT record.  "
-				"Leaving inconsistent metadata.");
+		antfs_logger(((struct antfs_sb_info *)
+			    ANTFS_I(ni)->i_sb->s_fs_info)->logger,
+			    "Failed to free base MFT record. Leaving "
+			    "inconsistent metadata");
 	}
 	ni = NULL;
 out:
@@ -1924,7 +1916,9 @@ static int ntfs_link_i(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 	return 0;
 
 rollback_failed:
-	antfs_log_error("Rollback failed. Leaving inconsistent metadata.");
+	antfs_logger(((struct antfs_sb_info *)
+		    ANTFS_I(ni)->i_sb->s_fs_info)->logger,
+		    "Rollback failed. Leaving inconsistent metadata.");
 err_out:
 	ntfs_free(fn);
 	return err;

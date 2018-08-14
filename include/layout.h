@@ -139,8 +139,8 @@ enum NTFS_RECORD_TYPES {
  * Generic magic comparison macros. Finally found a use for the ## preprocessor
  * operator! (-8
  */
-#define ntfs_is_magic(x, m)	((u32)(x) == (u32)magic_##m)
-#define ntfs_is_magicp(p, m)	(*(u32 *)(p) == (u32)magic_##m)
+#define ntfs_is_magic(x, m)	((le32)(x) == (le32)magic_##m)
+#define ntfs_is_magicp(p, m)	(*(le32 *)(p) == (le32)magic_##m)
 
 /*
  * Specialised magic comparison macros for the NTFS_RECORD_TYPES defined above.
@@ -196,7 +196,7 @@ enum NTFS_RECORD_TYPES {
  * (usa_count * 2) has to be less than or equal to 510.
  */
 struct NTFS_RECORD {
-	uint32_t magic;		/* A four-byte magic identifying the
+	le32 magic;		/* A four-byte magic identifying the
 					   record type and/or status. */
 	le16 usa_ofs;		/* Offset to the Update Sequence Array (usa)
 				   from the start of the ntfs record. */
@@ -356,7 +356,7 @@ struct MFT_RECORD {
 	le16 usa_ofs;		/* See NTFS_RECORD definition above. */
 	le16 usa_count;		/* See NTFS_RECORD definition above. */
 	/*  8*/
-	uint64_t lsn;
+	le64 lsn;
 				/* $LogFile sequence number for this record.
 				   Changed every time the record is modified. */
 	/* 16*/
@@ -452,7 +452,7 @@ struct MFT_RECORD_OLD {
 	le16 usa_count;		/* See NTFS_RECORD definition above. */
 
 	/*  8*/
-	uint64_t lsn;
+	sle64 lsn;
 				/* $LogFile sequence number for this record.
 				   Changed every time the record is modified. */
 	/* 16*/
@@ -840,14 +840,14 @@ struct ATTR_RECORD {
 		/* Non-resident attributes. */
 		struct {
 			/* 16*/
-			uint64_t lowest_vcn;
+			sle64 lowest_vcn;
 				/* Lowest valid virtual cluster number
 				   for this portion of the attribute value or
 				   0 if this is the only extent (usually the
 				   case). - Only when an attribute list is used
 				   does lowest_vcn != 0 ever occur. */
 			/* 24*/
-			uint64_t highest_vcn;
+			sle64 highest_vcn;
 				/* Highest valid vcn of this extent of the
 				 * attribute value. - Usually there is only one
 				   portion, so this usually equals the attribute
@@ -1161,7 +1161,7 @@ struct ATTR_LIST_ENTRY {
 		   (always set this to where the name would
 		   start even if unnamed). */
 	/*  8*/
-	uint64_t lowest_vcn;
+	sle64 lowest_vcn;
 		/* Lowest virtual cluster number of this portion
 		   of the attribute value. This is usually 0. It
 		   is non-zero for the case where one attribute
@@ -2354,11 +2354,11 @@ struct INDEX_BLOCK {
 	le16 usa_count;		/* See NTFS_RECORD definition. */
 
 	/*  8*/
-	uint64_t lsn;
+	sle64 lsn;
 		/* $LogFile sequence number of the last
 		   modification of this index block. */
 	/* 16*/
-	uint64_t index_block_vcn;
+	sle64 index_block_vcn;
 		/* Virtual cluster number of the index block. */
 	/* 24*/
 	struct INDEX_HEADER index;
@@ -2578,7 +2578,7 @@ struct INDEX_ENTRY {
 				   the index. */
 	} __attribute__ ((__packed__)) key;
 	/* The (optional) index data is inserted here when creating.
-	   uint64_t vcn; If INDEX_ENTRY_NODE bit in ie_flags is set, the last
+	   sle64 vcn; If INDEX_ENTRY_NODE bit in ie_flags is set, the last
 	   eight bytes of this index entry contain the virtual
 	   cluster number of the index block that holds the
 	   entries immediately preceding the current entry.

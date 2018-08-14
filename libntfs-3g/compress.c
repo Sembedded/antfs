@@ -1916,8 +1916,8 @@ int ntfs_compressed_close(struct ntfs_attr *na, struct runlist_element *wrl,
 			}
 		} else
 			done = TRUE;
-		ntfs_free(inbuf);
 	}
+	ntfs_free(inbuf);
 	if (done
 	    && check_valid_compressed_run(na, wrl, TRUE,
 					  "end compressed close"))

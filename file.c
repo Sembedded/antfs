@@ -75,7 +75,6 @@ int antfs_fsync(struct file *filp, loff_t start, loff_t end, int datasync)
 {
 	struct inode *inode = file_inode(filp);
 	struct ntfs_inode *ni = ANTFS_NI(inode);
-	struct ntfs_volume *vol = ni->vol;
 	int err;
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35)
@@ -85,17 +84,6 @@ int antfs_fsync(struct file *filp, loff_t start, loff_t end, int datasync)
 #else
 	err = generic_file_fsync(filp, start, end, datasync);
 #endif
-
-	if (vol->mftbmp_bh && buffer_dirty(vol->mftbmp_bh)) {
-		err = sync_dirty_buffer(vol->mftbmp_bh);
-		if (err)
-			antfs_log_error("Could not writeback $MFT!");
-	}
-	if (vol->lcnbmp_bh && buffer_dirty(vol->lcnbmp_bh)) {
-		err = sync_dirty_buffer(vol->lcnbmp_bh);
-		if (err)
-			antfs_log_error("Could not writeback $LCN!");
-	}
 
 	ntfs_inode_mark_dirty(ni);
 	ntfs_inode_sync(ni);
@@ -245,13 +233,12 @@ int antfs_get_block(struct inode *inode, sector_t iblock,
 	sector_t first_blk = 0;
 	size_t count = bh_result->b_size, total = 0;
 	s64 pos = (iblock << sb->s_blocksize_bits), offs;
-	VCN vcn = (iblock >> cb_diff_bits);
+	VCN vcn = pos >> vol->cluster_size_bits;
 	LCN lcn;
 	int err = 0;
 	/* Blocks offset into cluster. */
 	int blk_offs = iblock & ((1 << cb_diff_bits) - 1);
 
-	vcn = (pos >> vol->cluster_size_bits);
 	antfs_log_enter("blk %llu, pos %lld (vcn=%lld), b_size %zu",
 			(unsigned long long)iblock,
 			(long long)pos,
@@ -673,6 +660,10 @@ static int antfs_readpages(struct file *file, struct address_space *mapping,
 		if (!err && do_init_page) {
 			/* Initialize stuff past initialized_size with zero. */
 			page = grab_cache_page(mapping, page_idx_to_init);
+
+			if (!page)
+				return -ENOMEM;
+
 			antfs_log_debug("Zero @page_offs 0x%llx, len 0x%x, "
 					"buffer_len 0x%x",
 					(long long)page_offs,
@@ -749,6 +740,7 @@ static sector_t antfs_bmap(struct address_space *mapping, sector_t block)
  * antfs_zero_page - Zero (parts of) a page
  *
  * @page:      Page to work on
+ * @mapping:   Address space mapping to use
  * @offset:    Start offset into page to start zeroing
  * @len:       Number of bytes to zero
  * @base_blk:  1st block of this page on volume
@@ -757,11 +749,10 @@ static sector_t antfs_bmap(struct address_space *mapping, sector_t block)
  * mapped (relative to @ref base_blk) if they are changed and get set dirty and
  * uptodate.
  */
-static void antfs_zero_page(struct page *page,
+static void antfs_zero_page(struct page *page, struct address_space *mapping,
 		const loff_t offset, const loff_t len, const sector_t base_blk)
 {
 	struct buffer_head *bh_start, *bh;
-	struct address_space *mapping = page_mapping(page);
 	struct super_block *sb = mapping->host->i_sb;
 	const unsigned int blkbits = mapping->host->i_blkbits;
 	bool fully_mapped = true;
@@ -879,7 +870,8 @@ static void antfs_zero_clusters_on_rl(struct ntfs_inode *ni,
 			if (!page)
 				break;
 
-			antfs_zero_page(page, pg_offs, pg_zero_len, base_blk);
+			antfs_zero_page(page, mapping, pg_offs, pg_zero_len,
+					base_blk);
 
 			unlock_page(page);
 			put_page(page);
@@ -955,7 +947,7 @@ static void antfs_zero_cluster(struct ntfs_inode *ni, struct page *curr_page,
 		loff_t len = min_t(loff_t, to - from, PAGE_SIZE - offset);
 
 		if (page) {
-			antfs_zero_page(page, offset, len,
+			antfs_zero_page(page, mapping, offset, len,
 					curr_cluster_startblk +
 					((index << (PAGE_SHIFT - blkbits)) &
 					 cluster_blk_mask));
@@ -1023,15 +1015,15 @@ static void antfs_write_failed(struct address_space *mapping, loff_t to)
  *       vfs will repeat till it works!
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 36)
-int antfs_write_begin(struct file *filp, struct address_space *mapping,
-		      loff_t pos, unsigned len, unsigned flags,
-		      struct page **pagep,
-		      void **fsdata __attribute__((unused)))
+static int antfs_write_begin(struct file *filp, struct address_space *mapping,
+			     loff_t pos, unsigned len, unsigned flags,
+			     struct page **pagep,
+			     void **fsdata __attribute__((unused)))
 #else
-int antfs_write_begin(struct file *filp, struct address_space *mapping,
-		      loff_t pos, unsigned len, unsigned flags,
-		      struct page **pagep,
-		      void **fsdata)
+static int antfs_write_begin(struct file *filp, struct address_space *mapping,
+			     loff_t pos, unsigned len, unsigned flags,
+			     struct page **pagep,
+			     void **fsdata)
 #endif
 {
 	int err;
@@ -1188,7 +1180,7 @@ static int antfs_write_end(struct file *filp, struct address_space *mapping,
 		} else {
 			antfs_log_error("Got na not AT_DATA (0x%02x) and "
 					"AT_UNNAMED (??) for ino %lld",
-					(int)na->type,
+					(int)le32_to_cpu(na->type),
 					(long long)ni->mft_no);
 		}
 	}
@@ -1198,10 +1190,10 @@ static int antfs_write_end(struct file *filp, struct address_space *mapping,
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0)
-ssize_t antfs_aio_write(struct kiocb *iocb, const struct iovec *iov,
-			unsigned long nr_segs, loff_t pos)
+static ssize_t antfs_aio_write(struct kiocb *iocb, const struct iovec *iov,
+			       unsigned long nr_segs, loff_t pos)
 #else
-ssize_t antfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+static ssize_t antfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 #endif
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
@@ -1295,8 +1287,9 @@ out:
 	return err;
 }
 
-ssize_t antfs_splice_write(struct pipe_inode_info *pipe, struct file *out,
-			   loff_t *ppos, size_t len, unsigned int flags)
+static ssize_t antfs_splice_write(struct pipe_inode_info *pipe,
+				  struct file *out, loff_t *ppos, size_t len,
+				  unsigned int flags)
 {
 	struct inode *inode = file_inode(out);
 	struct ntfs_inode *ni = ANTFS_NI(inode);

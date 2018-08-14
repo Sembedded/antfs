@@ -453,8 +453,6 @@ static bool valid_reparse_data(struct ntfs_inode *ni,
 			break;
 		}
 	}
-	if (!ok)
-		ok = -EINVAL;
 
 	return ok;
 }

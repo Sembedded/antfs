@@ -1,5 +1,5 @@
 config ANTFS_FS
-	bool "NTFS file system by AVM"
+	tristate "NTFS file system by AVM"
 	default n
 	help
 	  NTFS is the file system of Microsoft Windows NT, 2000, XP and 2003.
@@ -12,3 +12,8 @@ config ANTFS_FS
 	  *use ACLs (everything is RWXRWXRWX)
 
 	  If you don't use a NTFS partition, say N.
+
+config ANTFS_SYMLINKS
+	bool "Support reading symlinks in antfs"
+	default n
+	depends on ANTFS_FS

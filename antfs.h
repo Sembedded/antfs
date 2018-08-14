@@ -4,6 +4,10 @@
 #include <linux/version.h>
 #include <linux/err.h>
 
+#ifdef CONFIG_AVM_ENHANCED
+#include <linux/avm_debug.h>
+#endif
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
 static inline long IS_ERR_OR_NULL(const void *ptr)
 {
@@ -18,6 +22,10 @@ static inline long IS_ERR_OR_NULL(const void *ptr)
 #define ANTFS_LOGLEVEL_WARN	    4
 #define ANTFS_LOGLEVEL_INFO	    5
 #define ANTFS_LOGLEVEL_DBG	    6
+
+#ifndef CONFIG_AVM_ENHANCED
+#define avm_logger_printk_ratelimited(logger, fmt, ...)
+#endif
 
 /**
  * Make sure to set loglevel to at least 'ANTFS_LOGLEVEL_CRIT' if you want to
@@ -129,6 +137,13 @@ static inline long IS_ERR_OR_NULL(const void *ptr)
 #define antfs_log_leave(fmt, ...)
 #endif
 
+/* macro that calls avm_logger_printk_ratelimited and antfs_log_critical */
+#define antfs_logger(logger, fmt, ...) \
+	do { \
+		avm_logger_printk_ratelimited(logger, "[%s] " fmt "\n", \
+			 __func__, ##__VA_ARGS__); \
+		antfs_log_critical(fmt, ##__VA_ARGS__); \
+	} while (0)
 /*--- #define ANTFS_EARLY_BLALLOC ---*/
 
 #include <linux/fs.h>
@@ -220,7 +235,6 @@ struct antfs_sb_info {
 	struct ntfs_volume *vol;	/* NTFS volume structure */
 	struct super_block *sb;	/* Super block */
 	const char *dev;	/* Device name */
-	char *mnt_point;	/* Absolute path to mount point */
 
 	/* Mount flags */
 	unsigned int atime;	/* 0:ENABLED, 1:DISABLED, 2:RELATIVE */
@@ -236,6 +250,9 @@ struct antfs_sb_info {
 	unsigned char inherit;	/* for permission checking */
 	struct SECURITY_CONTEXT *security;
 	char *usermap_path;
+#ifdef CONFIG_AVM_ENHANCED
+	struct _logger_priv *logger;
+#endif
 };
 
 struct antfs_inode_info {
@@ -290,8 +307,6 @@ void antfs_parse_options(struct antfs_sb_info *sbi, char *data);
 int antfs_inode_init(struct inode *inode);
 
 void antfs_sbi_destroy(struct antfs_sb_info *sbi);
-
-int antfs_set_mountpoint(struct antfs_sb_info *sbi);
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35)
 int antfs_fsync(struct file *filp, struct dentry *dentry, int datasync);

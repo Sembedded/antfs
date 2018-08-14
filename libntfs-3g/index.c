@@ -204,10 +204,10 @@ void ntfs_index_ctx_reinit(struct ntfs_index_context *icx)
 	};
 }
 
-static uint64_t *ntfs_ie_get_vcn_addr(struct INDEX_ENTRY *ie)
+static sle64 *ntfs_ie_get_vcn_addr(struct INDEX_ENTRY *ie)
 {
-	return (uint64_t *) ((u8 *) ie + le16_to_cpu(ie->length) -
-			     sizeof(uint64_t));
+	return (sle64 *) ((u8 *) ie + le16_to_cpu(ie->length) -
+			     sizeof(sle64));
 }
 
 /**
@@ -406,6 +406,7 @@ static int ntfs_ia_check(struct ntfs_index_context *icx, struct INDEX_BLOCK *ib,
 
 	if (!ntfs_is_indx_record(ib->magic)) {
 
+		/* log? message for already corrupt ib signature? */
 		antfs_log_error("Corrupt index block signature: vcn %lld inode "
 				"%llu", (long long)vcn,
 				(unsigned long long)icx->ni->mft_no);
@@ -1305,7 +1306,12 @@ retry:
 
 	err = ntfs_resident_attr_value_resize(ctx->mrec, ctx->attr,
 					      ix_root_size);
-	if (err) {
+	/* synchronize sizes to na */
+	if (!err) {
+		struct ntfs_attr *na = ANTFS_NA(ctx->ntfs_ino);
+		na->data_size = na->initialized_size = ix_root_size;
+		na->allocated_size = (ix_root_size + 7) & ~7;
+	} else {
 		/*
 		 * When there is no space to build a non-resident
 		 * index, we may have to move the root to an extent
@@ -2169,6 +2175,8 @@ static struct INDEX_ENTRY *ntfs_index_walk_down(struct INDEX_ENTRY *ie,
 			ictx->ir = NULL;
 			ictx->ib = (struct INDEX_BLOCK *)
 				ntfs_malloc(ictx->block_size);
+			if (!ictx->ib)
+				return NULL;
 			ictx->pindex = 1;
 			ictx->is_in_root = FALSE;
 		} else {

@@ -26,7 +26,6 @@
 #include "param.h"
 #include "types.h"
 #include "volume.h"
-#include "cache.h"
 #include "inode.h"
 #include "attrib.h"
 #include "debug.h"
@@ -550,7 +549,7 @@ struct ntfs_inode *ntfs_extent_inode_open(struct ntfs_inode *base_ni,
 
 	vol = base_ni->vol;
 	/* check if we already opened an instance of this mref */
-	inode = ilookup(vol->dev->d_sb, (unsigned long)MREF(mref));
+	inode = ilookup(vol->dev->d_sb, (unsigned long)mft_no);
 	if (inode) {
 		/* We found a match! Just return the ntfs inode belonging to the
 		 * vfs inode we just found. Never reopen a ntfs inode!
@@ -770,6 +769,7 @@ static int ntfs_inode_sync_standard_information(struct ntfs_inode *ni)
 	lth = le32_to_cpu(lthle);
 	if (test_nino_flag(ni, v3_Extensions)
 	    && (lth <= sizeof(struct STANDARD_INFORMATION)))
+		/* log? did we corrupt the inode now? */
 		antfs_log_error("bad sync of standard information");
 
 	if (lth > sizeof(struct STANDARD_INFORMATION)) {
@@ -829,6 +829,7 @@ static int ntfs_inode_sync_file_name(struct ntfs_inode *ni,
 		fn = (struct FILE_NAME_ATTR *) ((u8 *) ctx->attr +
 					 le16_to_cpu(ctx->attr->value_offset));
 		if (MREF_LE(fn->parent_directory) == ni->mft_no) {
+			/* AT_FILE_NAME for inode itself: */
 			/*
 			 * WARNING: We cheat here and obtain 2 attribute
 			 * search contexts for one inode (first we obtained
@@ -858,15 +859,6 @@ static int ntfs_inode_sync_file_name(struct ntfs_inode *ni,
 					le64_to_cpu(fn->parent_directory));
 			continue;
 		}
-#if 0
-		if (ni != index_ni &&  !dir_ni &&
-			/* FIXME: Deadlock hier! 2 */
-				mutex_lock_interruptible_nested(
-					&index_ni->ni_lock, NI_MUTEX_PARENT)) {
-			err = -ERESTARTSYS;
-			goto err_out;
-		}
-#else
 		if (ni != index_ni &&  !dir_ni) {
 			if (mutex_lock_interruptible_nested(&index_ni->ni_lock,
 						NI_MUTEX_PARENT)) {
@@ -874,7 +866,6 @@ static int ntfs_inode_sync_file_name(struct ntfs_inode *ni,
 				goto err_out;
 			}
 		}
-#endif
 		ictx = ntfs_index_ctx_get(index_ni, NTFS_INDEX_I30, 4);
 		if (IS_ERR(ictx)) {
 			if (!err)
@@ -912,10 +903,10 @@ static int ntfs_inode_sync_file_name(struct ntfs_inode *ni,
 		fnx->file_attributes =
 		    (fnx->file_attributes & ~FILE_ATTR_VALID_FLAGS) |
 		    (ni->flags & FILE_ATTR_VALID_FLAGS);
-		if (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY)
+		if (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) {
 			fnx->data_size = fnx->allocated_size
 			    = const_cpu_to_sle64(0);
-		else {
+		} else {
 			/* The allocated_size field of the file_name_attr holds
 			 * either the allocated_size of a file, or the
 			 * compressed_size.
@@ -937,9 +928,8 @@ static int ntfs_inode_sync_file_name(struct ntfs_inode *ni,
 			 * The file name record has also to be fixed if some
 			 * attribute update implied the unnamed data to be
 			 * made non-resident
-			 * TODO: Why is this here and fn->data_size update is
-			 *       not?
 			 */
+			fn->data_size = fnx->data_size;
 			fn->allocated_size = fnx->allocated_size;
 		}
 		/* update or clear the reparse tag in the index */
@@ -1057,6 +1047,7 @@ static int ntfs_inode_sync_in_dir(struct ntfs_inode *ni,
 				err = -EBUSY;
 			if (!ret || err == -EIO)
 				ret = err;
+			/* log? did we corrupt the inode? */
 			antfs_log_warning("Failed to sync FILE_NAME (ino %lld)",
 					  (long long)ni->mft_no);
 			NInoFileNameSetDirty(ni);
@@ -1120,6 +1111,7 @@ sync_inode:
 			if (!ret || err == -EIO)
 				ret = err;
 			NInoSetDirty(ni);
+			/* log? is this critical? */
 			antfs_log_error("MFT record sync failed, inode %lld",
 					(long long)ni->mft_no);
 		}
@@ -1222,6 +1214,7 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 		aln = ntfs_realloc(al, al_len);
 		if (!aln) {
 			err = -ENOMEM;
+			/* log? is a failed realloc critical in this case? */
 			antfs_log_error("Failed to realloc %d bytes", al_len);
 			goto put_err_out;
 		}
@@ -1316,8 +1309,11 @@ remove_attrlist_record:
 	ntfs_attr_reinit_search_ctx(ctx);
 	if (!ntfs_attr_lookup(AT_ATTRIBUTE_LIST, NULL, 0,
 			      CASE_SENSITIVE, 0, NULL, 0, ctx)) {
-		if (ntfs_attr_record_rm(ctx))
-			antfs_log_error("Rollback failed to remove attrlist");
+		if (ntfs_attr_record_rm(ctx)) {
+			antfs_logger(((struct antfs_sb_info *)
+				ANTFS_I(ni)->i_sb->s_fs_info)->logger,
+				"Rollback failed to remove attrlist");
+		}
 	} else
 		antfs_log_error("Rollback failed to find attrlist");
 	/* Setup back in-memory runlist. */
@@ -1338,9 +1334,11 @@ rollback:
 					      CASE_SENSITIVE,
 					      sle64_to_cpu(ale->lowest_vcn),
 					      NULL, 0, ctx)) {
-				if (ntfs_attr_record_move_to(ctx, ni))
-					antfs_log_error("Rollback failed to "
-							"move attribute");
+				if (ntfs_attr_record_move_to(ctx, ni)) {
+					antfs_logger( ((struct antfs_sb_info *)
+					 ANTFS_I(ni)->i_sb->s_fs_info)->logger,
+					"Rollback failed to move attribute");
+				}
 			} else
 				antfs_log_error("Rollback failed to find attr");
 			ntfs_attr_reinit_search_ctx(ctx);

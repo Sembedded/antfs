@@ -34,7 +34,6 @@
 #include "runlist.h"
 #include "logfile.h"
 #include "dir.h"
-#include "cache.h"
 #include "misc.h"
 
 /**
@@ -70,6 +69,14 @@ static int __ntfs_volume_release(struct ntfs_volume *v)
 	int tmp_err, err = 0;
 
 	ntfs_inode_close_free(&v->vol_ni);
+	if (v->mftbmp_bh) {
+		brelse(v->mftbmp_bh);
+		v->mftbmp_bh = NULL;
+	}
+	if (v->lcnbmp_bh) {
+		brelse(v->lcnbmp_bh);
+		v->lcnbmp_bh = NULL;
+	}
 	/*
 	 * FIXME: Inodes must be synced before closing
 	 * attributes, otherwise unmount could fail.
@@ -162,6 +169,7 @@ static int ntfs_mft_load(struct ntfs_volume *vol)
 	if (err) {
 		antfs_log_error("Failed to initialize the MFT!");
 		iget_failed(ANTFS_I(vol->mft_ni));
+		vol->mft_ni = NULL;
 		goto error_exit;
 	}
 	/* Can't use any of the higher level functions yet! */
@@ -201,8 +209,8 @@ static int ntfs_mft_load(struct ntfs_volume *vol)
 	if (l <= 0 || l > 0x40000) {
 		antfs_log_error("$MFT/$ATTR_LIST invalid length (%lld).",
 			       (long long)l);
-		err = (int)l;
-		goto io_error_exit;
+		err = l < 0 ? (int)l : -EIO;
+		goto error_exit;
 	}
 	vol->mft_ni->attr_list_size = l;
 	vol->mft_ni->attr_list = ntfs_malloc(l);
@@ -1334,7 +1342,7 @@ int ntfs_umount(struct ntfs_volume *vol,
 	struct ntfs_device *dev;
 	int ret;
 
-	if (!vol)
+	if (IS_ERR_OR_NULL(vol))
 		return -EINVAL;
 	dev = vol->dev;
 	ret = __ntfs_volume_release(vol);

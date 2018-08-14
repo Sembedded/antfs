@@ -79,7 +79,7 @@ struct RESTART_PAGE_HEADER {
 	le16 usa_count;
 		/* See NTFS_RECORD definition in layout.h. */
 	/*  8*/
-	uint64_t chkdsk_lsn;
+	sle64 chkdsk_lsn;
 		/* The last log file sequence number found by
 		   chkdsk.  Only used when the magic is changed
 		   to "CHKD".  Otherwise this is zero. */
@@ -146,7 +146,7 @@ typedef le16 RESTART_AREA_FLAGS;
 struct RESTART_AREA {
 /*Ofs*/
 	/*  0*/
-	uint64_t current_lsn;
+	sle64 current_lsn;
 		/* The current, i.e. last LSN inside the log
 		   when the restart area was last written.
 		   This happens often but what is the interval?
@@ -314,11 +314,11 @@ struct RESTART_AREA {
 struct LOG_CLIENT_RECORD {
 /*Ofs*/
 	/*  0*/
-	uint64_t oldest_lsn;
+	sle64 oldest_lsn;
 		/* Oldest LSN needed by this client.  On create
 		   set to 0. */
 	/*  8*/
-	uint64_t client_restart_lsn;
+	sle64 client_restart_lsn;
 		/* LSN at which this client needs to restart
 		   the volume, i.e. the current position within
 		   the log file.  At present, if clean this
@@ -380,7 +380,7 @@ struct RECORD_PAGE_HEADER {
 	le16 usa_count;    /* See NTFS_RECORD definition in layout.h. */
 
 	union {
-		uint64_t last_lsn;
+		sle64 last_lsn;
 		sle64 file_offset;
 	} __attribute__ ((__packed__)) copy;
 	le32 flags;
@@ -388,7 +388,7 @@ struct RECORD_PAGE_HEADER {
 	le16 page_position;
 	le16 next_record_offset;
 	le16 reserved[3];
-	uint64_t last_end_lsn;
+	sle64 last_end_lsn;
 } __attribute__ ((__packed__));
 
 /**
@@ -446,9 +446,9 @@ enum ATTRIBUTE_FLAGS {
  * Each log record seems to have a constant size of 0x70 bytes.
  */
 struct LOG_RECORD {
-	uint64_t this_lsn;
-	uint64_t client_previous_lsn;
-	uint64_t client_undo_next_lsn;
+	sle64 this_lsn;
+	sle64 client_previous_lsn;
+	sle64 client_undo_next_lsn;
 	le32 client_data_length;
 	struct LOG_CLIENT_ID client_id;
 	enum LOG_RECORD_TYPE record_type;
@@ -472,16 +472,16 @@ struct LOG_RECORD {
 			le16 attribute_offset;
 			le16 cluster_index;
 			enum ATTRIBUTE_FLAGS attribute_flags;
-			uint64_t target_vcn;
+			sle64 target_vcn;
 			/* Now at ofs 0x50. */
-			uint64_t lcn_list[0];
+			sle64 lcn_list[0];
 			/* Only present if lcns_to_follow is not 0. */
 		} __attribute__ ((__packed__));
 		struct {
-			uint64_t transaction_lsn;
-			uint64_t attributes_lsn;
-			uint64_t names_lsn;
-			uint64_t dirty_pages_lsn;
+			sle64 transaction_lsn;
+			sle64 attributes_lsn;
+			sle64 names_lsn;
+			sle64 dirty_pages_lsn;
 			le64 unknown_list[0];
 		} __attribute__ ((__packed__));
 	} __attribute__ ((__packed__));
@@ -509,7 +509,7 @@ struct ATTR_OLD {    /* Format up to Win10 (44 bytes) */
 	le64 unknown1;
 	le64 unknown2;
 	le64 inode;
-	uint64_t lsn;
+	sle64 lsn;
 	le32 unknown3;
 	le32 type;
 	le32 unknown4;
@@ -521,7 +521,7 @@ struct ATTR_NEW {    /* Format since Win10 (40 bytes) */
 	le32 type;
 	le32 unknown3;
 	le64 inode;
-	uint64_t lsn;
+	sle64 lsn;
 } __attribute__ ((__packed__));
 
 extern bool ntfs_check_logfile(struct ntfs_attr *log_na,

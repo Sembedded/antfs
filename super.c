@@ -38,18 +38,11 @@
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
 #include <linux/sched/task.h>
 #endif
-#include <linux/exportfs.h>
-#include <linux/nsproxy.h>
-#include <linux/mnt_namespace.h>
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 3, 0))
-#include "../mount.h"
-#endif
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("AVM GmbH");
 MODULE_DESCRIPTION("NTFS Filesystem");
 
-struct super_block *antfs_sbp;
 struct kmem_cache *antfs_inode_cachep;
 
 enum {
@@ -78,8 +71,10 @@ static const match_table_t tokens = {
  */
 void antfs_sbi_destroy(struct antfs_sb_info *sbi)
 {
+#ifdef CONFIG_AVM_ENHANCED
+	avm_logger_close(sbi->logger);
+#endif
 	kfree(sbi->dev);
-	kfree(sbi->mnt_point);
 	kfree(sbi);
 }
 
@@ -171,7 +166,7 @@ void antfs_parse_options(struct antfs_sb_info *sbi, char *data)
  * antfs_volume_finish sets the last fields that the ntfs driver needs
  * to work properly which didn't get set during the actual mount.
  */
-void antfs_volume_init_complete(struct antfs_sb_info *sbi)
+static void antfs_volume_init_complete(struct antfs_sb_info *sbi)
 {
 	struct ntfs_volume *vol = sbi->vol;
 
@@ -322,122 +317,6 @@ static void antfs_sbi_init(struct super_block *sb, struct antfs_sb_info *sbi)
 }
 
 /**
- * @brief saves the mount point to the sbi structure
- *
- * @param sbi	ntfs device specific superblock info
- *
- * @return 0 if everything worked out, -EIO otherwise
- *
- * antfs_set_mountpoint is creating the mount point by reading the volume's
- * name out of the ntfs_volume structure and if needed trims the name back to
- * its intended length (Windows seems to add a ' ' character at the end of the
- * volumes name). The mount point gets stored in @sbi to change the entry point
- * of the reparse points of ntfs symlinks to the actual mount point.
- */
-int antfs_set_mountpoint(struct antfs_sb_info *sbi)
-{
-	const int max_path_len = 512;
-	char *buf, *p, *end;
-	int err = 0;
-	struct nsproxy *nsp;
-	struct mnt_namespace *ns;
-	struct dentry *sb_root = dget(sbi->sb->s_root);
-	struct path mnt_path = {.dentry = sb_root };
-	struct list_head *head;
-	struct vfsmount *vfsmnt = NULL;
-
-	antfs_log_enter();
-
-	rcu_read_lock();
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0))
-	nsp = task_nsproxy(current);
-#else
-	task_lock(current);
-	nsp = current->nsproxy;
-#endif
-	if (!nsp || !nsp->mnt_ns) {
-		antfs_log_error("Name space proxy NULL.");
-		err = -EIO;
-		goto err_rcu;
-	}
-	buf = kmalloc(max_path_len, GFP_NOWAIT);
-	if (!buf) {
-		antfs_log_error("OOM");
-		err = -ENOMEM;
-		goto err_rcu;
-	}
-
-	/* Find vfsmount for first matching root dentry from current process. */
-	ns = nsp->mnt_ns;
-	get_mnt_ns(ns);
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 17, 0))
-	task_unlock(current);
-#endif
-	rcu_read_unlock();
-
-	list_for_each(head, &ns->list) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 3, 0)
-		vfsmnt =
-		    &((struct mount *)
-		      list_entry(head, struct mount, mnt_list))->mnt;
-#else
-		vfsmnt = list_entry(head, struct vfsmount, mnt_list);
-#endif
-		if (vfsmnt->mnt_root == sb_root) {
-			mntget(vfsmnt);
-			break;
-		}
-	}
-	put_mnt_ns(ns);
-
-	if (!vfsmnt || vfsmnt->mnt_root != sb_root) {
-		kfree(buf);
-		antfs_log_error
-		    ("Could not find mount point with current process.");
-		err = -EIO;
-		goto err_put;
-	}
-
-	/* Get absolute mount point path from this. */
-	mnt_path.mnt = vfsmnt;
-	p = d_path(&mnt_path, buf, max_path_len);
-	if (IS_ERR(p)) {
-		err = PTR_ERR(p);
-		antfs_log_error("d_path failed: %d", err);
-		goto err_put;
-	}
-
-	/* Append '/' if not present and \0 */
-	end = mangle_path(buf, p, "");
-	if (!end) {
-		antfs_log_error("Problem with mangle_path.");
-		err = -EIO;
-		goto err_put;
-	}
-
-	if (*(end - 1) != '/')
-		*end++ = '/';
-	*end = '\0';
-
-	antfs_log_debug("Got mntpoint: \"%s\"", buf);
-
-	sbi->mnt_point = buf;
-
-err_put:
-	mntput(vfsmnt);
-out:
-	dput(sb_root);
-	antfs_log_leave();
-	return err;
-err_rcu:
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 17, 0))
-	task_unlock(current);
-#endif
-	rcu_read_unlock();
-	goto out;
-}
-
-/**
  * @brief starts the mounting process of a ntfs device
  *
  * @param sb	    super_block for the ntfs device to mount
@@ -468,6 +347,9 @@ static int antfs_fill_super(struct super_block *sb, void *data, int silent)
 {
 	struct antfs_sb_info *sbi;
 	int err = 0;
+#ifdef CONFIG_AVM_ENHANCED
+	char *loggername;
+#endif		
 
 	sbi = kzalloc(sizeof(struct antfs_sb_info), GFP_KERNEL);
 	if (!sbi) {
@@ -476,14 +358,25 @@ static int antfs_fill_super(struct super_block *sb, void *data, int silent)
 	}
 
 	antfs_sbi_init(sb, sbi);
-	antfs_mnt_opts_init(sb, silent);
-	antfs_parse_options(sbi, data);
 
-	/* TODO: Implement handling non-utf8 coding */
-	if (!sbi->utf8) {
-		pr_err("ANTFS: You need to supply \"-o utf8\" mount option.\n");
+#ifdef CONFIG_AVM_ENHANCED
+	loggername = kmalloc(sizeof(char) * 16, GFP_KERNEL);
+	if (!loggername) {
+		err = -ENOMEM;
 		goto err;
 	}
+
+	sprintf(loggername, "antfs_%s", sb->s_id);
+	/* set up the avm_logger to submit critical errors that corrupt the
+	 * ntfs device */
+	sbi->logger = avm_logger_create(PAGE_SIZE, loggername,
+					logger_log_sd_dir);
+	kfree(loggername);
+	loggername = NULL;
+#endif
+
+	antfs_mnt_opts_init(sb, silent);
+	antfs_parse_options(sbi, data);
 
 	antfs_fill_super_operations(sb);
 	err = antfs_open_device(sb);
@@ -510,14 +403,15 @@ static int antfs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_time_gran = 1;
 
-	if (!antfs_inode_setup_root(sb))
+	err = antfs_inode_setup_root(sb);
+	if (!err)
 		goto out;
 err:
+	antfs_put_super(sb);
 	if (!err)
 		err = -EINVAL;
 
 	antfs_log_info("could not mount antfs! err:%d", err);
-	antfs_sbi_destroy(sbi);
 
 out:
 	return err;

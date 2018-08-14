@@ -61,38 +61,6 @@ struct antfs_mount_data {
 };
 
 /**
- * @brief updates the times in the vfs inode to the ntfs_inode times
- *
- * @param inode	vfs inode that should be updated
- * @param mask	bitmask that signaling which times to update
- *
- * antfs_inode_update_times is setting the times of the vfs inode according
- * to the given mask. It reads the times from the ntfs_inode which should be
- * kept up to date at all times!
- */
-void antfs_inode_update_times(struct inode *inode, struct ntfs_inode *ni,
-			      enum ntfs_time_update_flags mask)
-{
-	struct timespec ts;
-
-	if (mask & NTFS_UPDATE_ATIME) {
-		ts = ntfs2timespec(ni->last_access_time);
-		inode->i_atime.tv_sec = ts.tv_sec;
-		inode->i_atime.tv_nsec = ts.tv_nsec;
-	}
-	if (mask & NTFS_UPDATE_MTIME) {
-		ts = ntfs2timespec(ni->last_data_change_time);
-		inode->i_mtime.tv_sec = ts.tv_sec;
-		inode->i_mtime.tv_nsec = ts.tv_nsec;
-	}
-	if (mask & NTFS_UPDATE_CTIME) {
-		ts = ntfs2timespec(ni->last_mft_change_time);
-		inode->i_ctime.tv_sec = ts.tv_sec;
-		inode->i_ctime.tv_nsec = ts.tv_nsec;
-	}
-}
-
-/**
  * @brief allocation of a new inode.
  *
  * @param sb	super_block of the device the new inode should be created for
@@ -332,7 +300,7 @@ static int antfs_remount_fs(struct super_block *sb, int *flags, char *data)
  * allocated during mounting the device. Since the bdi was allocated, kfree()
  * needs to get called on it in order to prevent a memory leak.
  */
-static void antfs_put_super(struct super_block *sb)
+void antfs_put_super(struct super_block *sb)
 {
 	struct antfs_sb_info *sbi = ANTFS_SB(sb);
 
@@ -462,7 +430,7 @@ int antfs_inode_init(struct inode *inode)
 #endif
 	inode->i_ino = (loff_t)ni->mft_no;
 
-	if (likely(ni->nr_extents >= 0 && (inode->i_ino >
+	if (likely(ni->nr_extents >= 0 && (inode->i_ino >=
 					(unsigned long)FILE_FIRST_USER ||
 					inode->i_ino ==
 					(unsigned long)FILE_ROOT))) {
@@ -476,11 +444,21 @@ int antfs_inode_init(struct inode *inode)
 		inode->i_blocks = (ANTFS_NA(ni)->allocated_size + 511) >> 9;
 
 		if (ni->flags & FILE_ATTR_REPARSE_POINT) {
-			/* - symlink with reparse point - */
-			inode->i_mode |= S_IFLNK | sbi->umask;
+			if (IS_ENABLED(CONFIG_ANTFS_SYMLINKS)) {
+				/* - symlink with reparse point - */
+				inode->i_mode = S_IFLNK | sbi->umask;
 
-			antfs_inode_init_symlink(inode);
-			set_nlink(inode, le16_to_cpu(ni->mrec->link_count));
+				antfs_inode_init_symlink(inode);
+				set_nlink(inode, le16_to_cpu(
+							ni->mrec->link_count));
+			} else {
+				/* Don't support symlinks here. */
+				make_bad_inode(inode);
+				/* Shut up unlock_new_inode in iget_failed. */
+				inode->i_state |= I_NEW;
+				err = -EPERM;
+				goto out;
+			}
 		} else if (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) {
 			inode->i_mode = S_IFDIR | sbi->umask;
 			/* TODO: do we need to do this? */
@@ -542,6 +520,10 @@ int antfs_inode_init(struct inode *inode)
 		/* This fails if we already have an inode with the same
 		 * i_ino and i_sb that is not I_FREEING or I_WILL_FREE. */
 		struct inode *c_inode = ilookup(inode->i_sb, inode->i_ino);
+
+		avm_logger_printk_ratelimited(((struct antfs_sb_info *)
+			    inode->i_sb->s_fs_info)->logger,
+			    "[%s] insert_inode_locked failed.\n", __func__);
 
 		antfs_log_error_ext("insert_inode_locked failed. ino collision?"
 				" (%lu)", inode->i_ino);
@@ -708,9 +690,10 @@ static int antfs_show_options(struct seq_file *m, struct dentry *root)
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 34)
-int antfs_write_inode(struct inode *inode, struct writeback_control *wbc)
+static int antfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 #else
-int antfs_write_inode(struct inode *inode, int do_sync __attribute__((unused)))
+static int antfs_write_inode(struct inode *inode,
+			     int do_sync __attribute__((unused)))
 #endif
 {
 	struct ntfs_inode *ni = ANTFS_NI(inode);

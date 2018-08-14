@@ -44,6 +44,20 @@ enum {
 	ZONE_DATA2 = 4
 };
 
+static const char __maybe_unused *get_zone_name(const int zone)
+{
+	switch (zone) {
+	case ZONE_MFT:
+		return "MFT";
+	case ZONE_DATA1:
+		return "DATA1";
+	case ZONE_DATA2:
+		return "DATA2";
+	default:
+		return "???";
+	}
+}
+
 static void ntfs_cluster_set_zone_pos(LCN start, LCN end, LCN *pos, LCN tc)
 {
 	antfs_log_debug("pos: %lld  tc: %lld", (long long)*pos, (long long)tc);
@@ -78,6 +92,22 @@ static void ntfs_cluster_update_zone_pos(struct ntfs_volume *vol, u8 zone,
 	}
 }
 
+static void antfs_force_zone_pos(struct ntfs_volume *vol, u8 zone,
+					 LCN lcn)
+{
+	antfs_log_enter("tc = %lld, zone = %d", (long long)tc, zone);
+
+	if (zone == ZONE_MFT) {
+		ntfs_cluster_set_zone_pos(vol->mft_lcn, vol->mft_zone_end,
+					  &vol->mft_zone_pos, lcn);
+	} else if (zone == ZONE_DATA1) {
+		ntfs_cluster_set_zone_pos(vol->mft_zone_end, vol->nr_clusters,
+					  &vol->data1_zone_pos, lcn);
+	} else {			/* zone == ZONE_DATA2 */
+		ntfs_cluster_set_zone_pos(0, vol->mft_zone_start,
+					  &vol->data2_zone_pos, lcn);
+	}
+}
 /*
  *		Unmark full zones when a cluster has been freed in a full zone
  *
@@ -331,7 +361,8 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 	LCN lcn;
 	LCN prev_lcn = 0, prev_run_len = 0;
 	s64 clusters;
-	int block_to_lcnbits, block_to_lcnbits_mask;
+	int block_to_lcnbits;
+	LCN block_to_lcnbits_mask;
 	int rlpos, rlsize;
 	int err = 0;
 	int pass = 1;
@@ -419,7 +450,7 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 
 		/* check whether we have exhausted the current zone */
 		if (search_zone & vol->full_zones)
-			goto zone_pass_done;
+			goto skip_zone;
 
 		buf_size = antfs_check_bh(vol, lcn, zone_end);
 		if (buf_size < 0) {
@@ -449,6 +480,8 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 			if (*byte & bit) {
 				LCN tmp_lcn = antfs_get_zone_pos(vol, lcn,
 								 search_zone);
+				int next_bmp_offs;
+
 				if (tmp_lcn != lcn) {
 					lcn = tmp_lcn;
 					bmp_offs = lcn - (vol->lcnbmp_start <<
@@ -457,17 +490,34 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 				}
 
 				/* We have no clue. Seek for a starting point */
-				bmp_offs =
+				next_bmp_offs =
 				    max_empty_bit_range(vol->lcnbmp_bh->b_data,
 						buf_size >> 3, bmp_offs + 1);
-				if (bmp_offs < 0) {
+				if (next_bmp_offs < 0 && bmp_offs) {
+					/* Didn't find anything behind bmp_offs.
+					 * Try again from buffer start.
+					 */
+					next_bmp_offs = max_empty_bit_range(
+							vol->lcnbmp_bh->
+							b_data,
+							buf_size >> 3, 0);
+				}
+				if (next_bmp_offs < 0) {
 					/* Didn't find clear bits in buffer */
 					lcn = (vol->lcnbmp_start + 1) <<
 						block_to_lcnbits;
 					break;
 				}
+				bmp_offs = next_bmp_offs;
 				lcn = bmp_offs + (vol->lcnbmp_start <<
 						  block_to_lcnbits);
+				/* For 2nd pass we search a block until we used
+				 * up every little space. Even go backwards in
+				 * zone_pos.
+				 */
+				if (pass == 2)
+					antfs_force_zone_pos(vol, search_zone,
+							lcn);
 				continue;
 			}
 			/* Found a clear bit / free LCN here */
@@ -536,13 +586,23 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 				ntfs_cluster_update_zone_pos(vol, search_zone,
 							     lcn);
 				goto done_ret;
-			} else {
-				pass = 1;
 			}
 
-			lcn++;
 			bmp_offs++;
-
+			/* Try harder in 2nd pass. If this buffer is really
+			 * full, we break out if max_empty_bit_range above
+			 * fails.
+			 */
+			if (pass == 2 && bmp_offs >= buf_size) {
+				/* Start over. */
+				lcn &= ~block_to_lcnbits_mask;
+				if (lcn < zone_start)
+					lcn = zone_start;
+				bmp_offs = lcn & block_to_lcnbits_mask;
+				antfs_force_zone_pos(vol, search_zone, lcn);
+			} else {
+				lcn++;
+			}
 		}
 
 		/* === couldn't find free lcn goto next buffer === */
@@ -552,7 +612,7 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 		/* go through the next bufferhead if we are still in the zone */
 		if (lcn < zone_end)
 			continue;
-zone_pass_done:
+
 		/* Walked whole zone here, didn't find nuffin */
 		antfs_log_debug("Finished current zone pass(%i).", pass);
 		if (pass == 1) {
@@ -583,9 +643,9 @@ zone_pass_skip:
 		/* pass == 2 */
 		/* Walked the zone from start to end here:
 		 * After that we can say it is full for sure. */
+		vol->full_zones |= search_zone;
 skip_zone:
 		done_zones |= search_zone;
-		vol->full_zones |= search_zone;
 		if (done_zones < (ZONE_MFT + ZONE_DATA1 + ZONE_DATA2)) {
 			antfs_log_debug("Switching zone.");
 			pass = 1;
@@ -653,14 +713,6 @@ switch_to_data1_zone:		search_zone = ZONE_DATA1;
 					(int)pass, (int)search_zone,
 					(long long)lcn, (long long)zone_start,
 					(long long)zone_end);
-			/* Hotfix: Just try again (if this ever happens). */
-			if (vol->free_clusters == nr_free) {
-				vol->full_zones = 0;
-				done_zones = 0;
-				search_zone = (zone == DATA_ZONE) ? ZONE_DATA1 :
-					ZONE_MFT;
-				goto zone_pass_skip;
-			}
 		}
 		err = -ENOSPC;
 		goto err_ret;
@@ -677,8 +729,8 @@ done_ret:
 done_err_ret:
 	if (err) {
 		if (err != -ENOSPC)
-			antfs_log_error("Failed to allocate clusters. err: %d",
-					err);
+			antfs_log_error("Failed to allocate %d clusters. "
+					"err: %d", (int)count, err);
 		rl = ERR_PTR(err);
 	}
 
@@ -742,10 +794,13 @@ int ntfs_cluster_free_from_rl(struct ntfs_volume *vol,
 	}
 out:
 	vol->free_clusters += nr_freed;
-	if (vol->free_clusters > vol->nr_clusters)
-		antfs_log_error("Too many free clusters (%lld > %lld)!",
+	if (vol->free_clusters > vol->nr_clusters) {
+		antfs_logger(((struct antfs_sb_info *)
+				vol->dev->d_sb->s_fs_info)->logger,
+				"Too many free clusters (%lld > %lld)!",
 				(long long)vol->free_clusters,
 				(long long)vol->nr_clusters);
+	}
 	return ret;
 }
 
@@ -832,6 +887,15 @@ out_locked:
 out:
 	if (vol->lcnbmp_bh)
 		mark_buffer_dirty(vol->lcnbmp_bh);
+
+	if (vol->free_clusters > vol->nr_clusters) {
+		antfs_logger(((struct antfs_sb_info *)
+				vol->dev->d_sb->s_fs_info)->logger,
+				"Too many free clusters (%lld > %lld)!",
+				(long long)vol->free_clusters,
+				(long long)vol->nr_clusters);
+	}
+
 	antfs_log_leave("err: %d", err);
 	return err;
 
@@ -845,8 +909,9 @@ rewind:
 			err = PTR_ERR(vol->lcnbmp_bh);
 			if (err == 0)
 				err = -EIO;
-			antfs_log_error("Rewind: Reading LCN bitmap failed: %d",
-					err);
+			antfs_logger(((struct antfs_sb_info *)
+				vol->dev->d_sb->s_fs_info)->logger,
+				"Rewind: Reading LCN bitmap failed: %d", err);
 			vol->lcnbmp_bh = NULL;
 			goto out_locked;
 		}
@@ -879,9 +944,10 @@ rewind:
 				err = PTR_ERR(vol->lcnbmp_bh);
 				if (err == 0)
 					err = -EIO;
-				antfs_log_critical("Failed to read the"
-						   "bitmap while rewinding! %d",
-						   err);
+				antfs_logger( ((struct antfs_sb_info *)
+					 vol->dev->d_sb->s_fs_info)->logger,
+					"Failed to read the bitmap while "
+					"rewinding! %d", err);
 				vol->lcnbmp_bh = NULL;
 				goto out_locked;
 			}
@@ -919,10 +985,13 @@ int ntfs_cluster_free_basic(struct ntfs_volume *vol, s64 lcn, s64 count)
 	}
 out:
 	vol->free_clusters += nr_freed;
-	if (vol->free_clusters > vol->nr_clusters)
-		antfs_log_error("Too many free clusters (%lld > %lld)!",
-				(long long)vol->free_clusters,
-				(long long)vol->nr_clusters);
+	if (vol->free_clusters > vol->nr_clusters) {
+		antfs_logger(((struct antfs_sb_info *)
+				vol->dev->d_sb->s_fs_info)->logger,
+				"Too many free clusters (%lld > %lld)!",
+				(long long) vol->free_clusters,
+				(long long) vol->nr_clusters);
+	}
 	return ret;
 }
 
@@ -1041,10 +1110,13 @@ int ntfs_cluster_free(struct ntfs_volume *vol, struct ntfs_attr *na,
 	err = nr_freed;
 out:
 	vol->free_clusters += nr_freed;
-	if (vol->free_clusters > vol->nr_clusters)
-		antfs_log_error("Too many free clusters (%lld > %lld)!",
-				(long long)vol->free_clusters,
-				(long long)vol->nr_clusters);
+	if (vol->free_clusters > vol->nr_clusters) {
+		antfs_logger(((struct antfs_sb_info *)
+			vol->dev->d_sb->s_fs_info)->logger,
+			"Too many free clusters (%lld > %lld)!",
+			(long long)vol->free_clusters,
+			(long long)vol->nr_clusters);
+	}
 leave:
 	antfs_log_leave();
 	return err;

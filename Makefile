@@ -1,53 +1,49 @@
-#
-# Makefile for the AVM NTFS filesystem.
-#
+KBUILD ?= /lib/modules/$(shell uname -r)/build
+VERSION ?= $(shell git describe --tags 2>/dev/null || echo unknown)
+DKMS_NAME = antfs
 
-MODULE_PATH := fs/antfs
-LIBNTFS_SRC := libntfs-3g
+Q ?= @
 
-#check if we are on a shared or p branch
+MODULE_CONFIG += CONFIG_ANTFS_FS=m
+MODULE_CONFIG += CONFIG_ANTFS_SYMLINKS=y
 
-GIT_CMD := git -C $(srctree)/$(MODULE_PATH)
-ifeq ($(shell $(GIT_CMD) rev-parse --abbrev-ref HEAD | grep -E "^(shared|p)\/"),)
-#stable, branch or something else
-EXTRA_CFLAGS += -DANTFS_LOGLEVEL_DEFAULT=ANTFS_LOGLEVEL_ERR
-EXTRA_CFLAGS += -DANTFS_VERSION=\"$(shell $(GIT_CMD) describe --tags | grep -o '^[0-9.]*')\"
-else
-#shared/ or p/
-EXTRA_CFLAGS += -DANTFS_LOGLEVEL_DEFAULT=ANTFS_LOGLEVEL_ERR_EXT
-EXTRA_CFLAGS += -DANTFS_VERSION=\"$(shell $(GIT_CMD) rev-parse --short HEAD)\"
-endif
+sources += $(wildcard include/*)
+sources += $(wildcard libntfs-3g/*)
+sources += $(wildcard *.h *.c)
+sources += Makefile Kbuild Kconfig
 
-EXTRA_CFLAGS += -I$(MODULE_PATH)
-EXTRA_CFLAGS += -I$(MODULE_PATH)/include
-#EXTRA_CFLAGS += -Wextra -Wshadow -Werror -Wno-error=shadow
+destination = $(DESTDIR)/usr/src/$(DKMS_NAME)-$(VERSION)
 
-obj-$(CONFIG_ANTFS_FS) += antfs.o
+default: antfs.ko
 
-antfs-y := \
-	dir.o \
-	file.o \
-	inode.o \
-	super.o \
-	$(LIBNTFS_SRC)/unistr.o \
-	$(LIBNTFS_SRC)/inode.o \
-	$(LIBNTFS_SRC)/device.o \
-	$(LIBNTFS_SRC)/mft.o \
-	$(LIBNTFS_SRC)/volume.o \
-	$(LIBNTFS_SRC)/bootsect.o \
-	$(LIBNTFS_SRC)/runlist.o \
-	$(LIBNTFS_SRC)/linux_io.o \
-	$(LIBNTFS_SRC)/dir.o \
-	$(LIBNTFS_SRC)/collate.o \
-	$(LIBNTFS_SRC)/lcnalloc.o \
-	$(LIBNTFS_SRC)/object_id.o \
-	$(LIBNTFS_SRC)/index.o \
-	$(LIBNTFS_SRC)/cache.o \
-	$(LIBNTFS_SRC)/attrlist.o \
-	$(LIBNTFS_SRC)/attrib.o \
-	$(LIBNTFS_SRC)/misc.o \
-	$(LIBNTFS_SRC)/reparse.o \
-	$(LIBNTFS_SRC)/logfile.o \
-	$(LIBNTFS_SRC)/compress.o \
-	$(LIBNTFS_SRC)/mst.o
+antfs.ko: force
+	$(MAKE) -C $(KBUILD) M=$(CURDIR) modules $(MODULE_CONFIG)
+	$(call cmd_strip,$@)
 
+clean: force
+	$(MAKE) -C $(KBUILD) M=$(CURDIR) clean
+
+.NOTPARALLEL:
+
+install: install-source install-dkms
+
+uninstall: uninstall-dkms uninstall-source
+
+install-source: force
+	@echo "INSTALL to $(destination)"
+	$(Q)echo $(sources) | tr " " "\n" | cpio -pmud --quiet $(destination)/
+	$(Q)sed -re 's,=ANTFS_VERSION,=$(VERSION),g' < dkms.conf > $(destination)/dkms.conf
+
+uninstall-source: force
+	@echo "PURGE $(destination)"
+	$(Q)rm -rf $(destination)
+	$(Q)rmdir --ignore-fail-on-non-empty --parents $(dir $(destination)) 2>/dev/null || true
+
+install-dkms: force
+	dkms add -m $(DKMS_NAME) -v $(VERSION)
+
+uninstall-dkms:
+	dkms remove -m $(DKMS_NAME) -v $(VERSION) --all
+	$(MAKE) uninstall-source
+
+force: ;

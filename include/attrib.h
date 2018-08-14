@@ -298,7 +298,6 @@ s64 ntfs_attr_mst_pwrite(struct ntfs_attr *na, const s64 pos,
 int ntfs_attr_map_runlist(struct ntfs_attr *na, VCN vcn);
 int ntfs_attr_map_whole_runlist(struct ntfs_attr *na);
 
-LCN ntfs_attr_vcn_to_lcn(struct ntfs_attr *na, const VCN vcn);
 struct runlist_element *ntfs_attr_find_vcn(struct ntfs_attr *na,
 						  const VCN vcn);
 
@@ -308,7 +307,6 @@ int ntfs_attr_can_be_resident(const struct ntfs_volume *vol,
 				     const enum ATTR_TYPES type);
 int ntfs_attr_make_non_resident(struct ntfs_attr *na,
 				struct ntfs_attr_search_ctx *ctx);
-int ntfs_attr_force_non_resident(struct ntfs_attr *na);
 int ntfs_make_room_for_attr(struct MFT_RECORD *m, u8 *pos, u32 size);
 
 int ntfs_resident_attr_record_add(struct ntfs_inode *ni, enum ATTR_TYPES type,
@@ -325,9 +323,6 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx);
 int ntfs_attr_add(struct ntfs_inode *ni, enum ATTR_TYPES type,
 			 ntfschar *name, u8 name_len, const u8 *val,
 			 s64 size);
-int ntfs_attr_set_flags(struct ntfs_inode *ni, enum ATTR_TYPES type,
-			       const ntfschar *name, u8 name_len,
-			       enum ATTR_FLAGS flags, enum ATTR_FLAGS mask);
 int ntfs_attr_rm(struct ntfs_attr *na);
 
 int ntfs_attr_record_resize(struct MFT_RECORD *m, struct ATTR_RECORD *a,
@@ -343,7 +338,6 @@ int ntfs_attr_record_move_away(struct ntfs_attr_search_ctx *ctx, int extra);
 int ntfs_attr_update_mapping_pairs(struct ntfs_attr *na, VCN from_vcn);
 
 int ntfs_attr_truncate(struct ntfs_attr *na, const s64 newsize);
-int ntfs_attr_truncate_solid(struct ntfs_attr *na, const s64 newsize);
 
 int antfs_do_cluster_alloc(struct ntfs_inode *ni, struct ntfs_attr *na,
 				  VCN vcn, size_t count, LCN *res_lcn);
@@ -385,13 +379,5 @@ int ntfs_attr_exist(struct ntfs_inode *ni, const enum ATTR_TYPES type,
 int ntfs_attr_remove(struct ntfs_inode *ni, const enum ATTR_TYPES type,
 			    ntfschar *name, u32 name_len);
 s64 ntfs_attr_get_free_bits(struct ntfs_attr *na);
-int ntfs_attr_data_read(struct ntfs_inode *ni,
-			       ntfschar *stream_name, int stream_name_len,
-			       char *buf, size_t size, off_t offset);
-int ntfs_attr_data_write(struct ntfs_inode *ni,
-				ntfschar *stream_name, int stream_name_len,
-				const char *buf, size_t size, off_t offset);
-int ntfs_attr_shrink_size(struct ntfs_inode *ni, ntfschar *stream_name,
-				 int stream_name_len, off_t offset);
 
 #endif /* defined _NTFS_ATTRIB_H */

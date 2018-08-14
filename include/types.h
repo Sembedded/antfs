@@ -39,13 +39,13 @@ typedef int16_t s16;
 typedef int32_t s32;
 typedef int64_t s64;
 
-typedef u16 le16;
-typedef u32 le32;
-typedef u64 le64;
+typedef __le16 le16;
+typedef __le32 le32;
+typedef __le64 le64;
 
-typedef u16 be16;
-typedef u32 be32;
-typedef u64 be64;
+typedef __be16 be16;
+typedef __be32 be32;
+typedef __be64 be64;
 
 /*
  * Declare s{l,b}e{16,32,64} to be unsigned because we do not want sign

@@ -210,6 +210,8 @@ int ntfs_inode_set_times(struct ntfs_inode *ni, const char *value,
 
 int ntfs_inode_na_open(struct ntfs_inode *ni);
 
+void antfs_put_super(struct super_block *sb);
+
 /* debugging */
 #define debug_double_inode(num, type)
 #define debug_cached_inode(ni)

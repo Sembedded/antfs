@@ -254,8 +254,7 @@ struct buffer_head *ntfs_load_bitmap_attr(struct ntfs_volume *vol,
 		return ERR_PTR(-EIO);
 	}
 
-	antfs_log_leave
-	    ("reading @ lcn %lld + %lld + block %lld = block %lld; "
+	antfs_log_leave("reading @ lcn %lld + %lld + block %lld = block %lld; "
 	     "cluster_size %d [bits]; block_size %d [bits]",
 	     (long long)rl->lcn, (long long)cn, (long long)block,
 	     (long long)(((rl->lcn + cn) << dbits) + block),
