@@ -131,7 +131,7 @@ struct ntfs_index_context {
 	int pindex;	/* maximum it's the number of the parent nodes  */
 	bool ib_dirty;
 	bool bad_index;
-	u32 block_size;
+	u8 block_size_bits;
 	u8 vcn_size_bits;
 };
 

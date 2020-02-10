@@ -476,11 +476,12 @@ struct ntfs_inode *ntfs_inode_open(struct ntfs_volume *vol, const MFT_REF mref,
 	 * acts as a cache for files like 'FILE_LOGFILE' etc.
 	 */
 	inode = ANTFS_I(ni);
-	err = antfs_inode_init(inode);
-	if (err) {
-		iget_failed(inode);
+	err = antfs_inode_init(&inode, ANTFS_INODE_INIT_REPLACE);
+	/* Inode may have changed here. */
+	if (err)
 		ni = ERR_PTR(err);
-	}
+	else
+		ni = ANTFS_NI(inode);
 out:
 	antfs_log_leave("ret: %d", IS_ERR(ni) ? (int)PTR_ERR(ni) : 0);
 	return ni;
@@ -631,16 +632,25 @@ struct ntfs_inode *ntfs_extent_inode_open(struct ntfs_inode *base_ni,
 	}
 	err = ntfs_file_record_read(base_ni->vol, le64_to_cpu(mref), &ni->mrec,
 				  NULL);
-	if (err)
-		goto err_out;
+	inode = ANTFS_I(ni);
+	if (err) {
+		/* Shut up unlock_new_inode in iget_failed. */
+		inode->i_state |= I_NEW;
+		iget_failed(inode);
+		goto out;
+	}
 
 	ni->mft_no = mft_no;
 	ni->nr_extents = -1;
 	ni->base_ni = base_ni;
 
-	err = antfs_inode_init(ANTFS_I(ni));
+	/* We really should not get a colliding inode here. Go berserk on
+	 * errors.
+	 */
+	err = antfs_inode_init(&inode, ANTFS_INODE_INIT_DISCARD);
 	if (err)
-		goto err_out;
+		goto out;
+	/* Inode should not have changed here. */
 
 attach:
 	/* Attach extent inode to base inode, reallocating memory if needed. */
@@ -649,8 +659,12 @@ attach:
 
 		extent_nis = ntfs_malloc(i);
 		if (!extent_nis) {
+			/* If we cannot attach the extent to base, close the
+			 * extent and error out.
+			 */
 			err = -ENOMEM;
-			goto err_out;
+			iput(inode);
+			goto out;
 		}
 		if (base_ni->nr_extents) {
 			memcpy(extent_nis, base_ni->extent_nis,
@@ -665,9 +679,6 @@ out:
 		ni = ERR_PTR(err);
 	antfs_log_leave("Exit: %d", err);
 	return ni;
-err_out:
-	iget_failed(ANTFS_I(ni));
-	goto out;
 }
 
 /**
@@ -856,7 +867,7 @@ static int ntfs_inode_sync_file_name(struct ntfs_inode *ni,
 				err = PTR_ERR(index_ni);
 			antfs_log_error("Failed to open inode %lld with index",
 					(long long)
-					le64_to_cpu(fn->parent_directory));
+					MREF_LE(fn->parent_directory));
 			continue;
 		}
 		if (ni != index_ni &&  !dir_ni) {
@@ -1310,8 +1321,7 @@ remove_attrlist_record:
 	if (!ntfs_attr_lookup(AT_ATTRIBUTE_LIST, NULL, 0,
 			      CASE_SENSITIVE, 0, NULL, 0, ctx)) {
 		if (ntfs_attr_record_rm(ctx)) {
-			antfs_logger(((struct antfs_sb_info *)
-				ANTFS_I(ni)->i_sb->s_fs_info)->logger,
+			antfs_logger(ANTFS_I(ni)->i_sb->s_id,
 				"Rollback failed to remove attrlist");
 		}
 	} else
@@ -1335,8 +1345,7 @@ rollback:
 					      sle64_to_cpu(ale->lowest_vcn),
 					      NULL, 0, ctx)) {
 				if (ntfs_attr_record_move_to(ctx, ni)) {
-					antfs_logger( ((struct antfs_sb_info *)
-					 ANTFS_I(ni)->i_sb->s_fs_info)->logger,
+					antfs_logger(ANTFS_I(ni)->i_sb->s_id,
 					"Rollback failed to move attribute");
 				}
 			} else
@@ -1446,40 +1455,4 @@ put_err_out:
 		antfs_log_debug("No attributes left that could be moved out.");
 	}
 	return err;
-}
-
-/**
- * ntfs_inode_update_times - update selected time fields for ntfs inode
- * @ni:		ntfs inode for which update time fields
- * @mask:	select which time fields should be updated
- *
- * This function updates time fields to current time. Fields to update are
- * selected using @mask (see enum @ntfs_time_update_flags for posssible values).
- */
-void ntfs_inode_update_times(struct ntfs_inode *ni,
-			     enum ntfs_time_update_flags mask)
-{
-	sle64 now;
-
-	if (IS_ERR_OR_NULL(ni)) {
-		antfs_log_error("Invalid arguments.");
-		return;
-	}
-
-	if ((ni->mft_no < FILE_FIRST_USER && ni->mft_no != FILE_ROOT) ||
-	    NVolReadOnly(ni->vol) || !mask) {
-		antfs_log_error("Invalid arguments.");
-		return;
-	}
-
-	now = ntfs_current_time();
-	if (mask & NTFS_UPDATE_ATIME)
-		ni->last_access_time = now;
-	if (mask & NTFS_UPDATE_MTIME)
-		ni->last_data_change_time = now;
-	if (mask & NTFS_UPDATE_CTIME)
-		ni->last_mft_change_time = now;
-
-	NInoFileNameSetDirty(ni);
-	NInoSetDirty(ni);
 }

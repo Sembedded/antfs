@@ -98,25 +98,6 @@ int ntfs_device_free(struct ntfs_device *dev)
 	return 0;
 }
 
-/*
- *		Sync the device
- *
- * @retval zero if successful
- * @retval negative error code on failure
- */
-int ntfs_device_sync(struct ntfs_device *dev)
-{
-	int err = 0;
-	struct ntfs_device_operations *dops;
-
-	if (NDevDirty(dev)) {
-		dops = dev->d_ops;
-		err = dops->sync(dev);
-	}
-
-	return err;
-}
-
 /**
  * ntfs_pread - positioned read from disk
  *
@@ -303,7 +284,7 @@ int ntfs_device_block_size_set(struct ntfs_device *dev, int block_size)
 	if (!dev)
 		return -EINVAL;
 
-	if (!sb_set_blocksize(dev->d_sb, block_size))
+	if (!sb_min_blocksize(dev->d_sb, block_size))
 		return -EINVAL;
 
 	return 0;

@@ -82,7 +82,7 @@ static int ntfs_ib_write(struct ntfs_index_context *icx, struct INDEX_BLOCK *ib)
 	antfs_log_enter("vcn: %lld", (long long)vcn);
 
 	ret = ntfs_attr_mst_pwrite(icx->ia_na, ntfs_ib_vcn_to_pos(icx, vcn),
-				   1, icx->block_size, ib);
+				   1, icx->block_size_bits, ib);
 	if (ret != 1) {
 		antfs_log_error("Failed to write index block %lld, inode %llu",
 				(long long)vcn,
@@ -423,14 +423,14 @@ static int ntfs_ia_check(struct ntfs_index_context *icx, struct INDEX_BLOCK *ib,
 		return -1;
 	}
 
-	if (ib_size != icx->block_size) {
+	if (ib_size != 1 << icx->block_size_bits) {
 
 		antfs_log_error
 		    ("Corrupt index block : VCN (%lld) of inode %llu "
 		     "has a size (%u) differing from the index "
 		     "specified size (%u)", (long long)vcn,
 		     (unsigned long long)icx->ni->mft_no, ib_size,
-		     icx->block_size);
+		     1 << icx->block_size_bits);
 		return -1;
 	}
 	antfs_log_leave();
@@ -634,7 +634,7 @@ static int ntfs_ib_read(struct ntfs_index_context *icx, VCN vcn,
 	pos = ntfs_ib_vcn_to_pos(icx, vcn);
 
 	ret =
-	    ntfs_attr_mst_pread(icx->ia_na, pos, 1, icx->block_size,
+	    ntfs_attr_mst_pread(icx->ia_na, pos, 1, icx->block_size_bits,
 				(u8 *) dst, true);
 	if (ret != 1) {
 		if (ret < 0) {
@@ -725,6 +725,7 @@ int ntfs_index_lookup(const void *key, const int key_len,
 	struct INDEX_ROOT *ir;
 	struct INDEX_ENTRY *ie;
 	struct INDEX_BLOCK *ib = NULL;
+	u32 block_size;
 	int err;
 
 	antfs_log_enter();
@@ -742,16 +743,25 @@ int ntfs_index_lookup(const void *key, const int key_len,
 		return err;
 	}
 
-	icx->block_size = le32_to_cpu(ir->index_block_size);
-	if (icx->block_size < NTFS_BLOCK_SIZE) {
+	block_size = le32_to_cpu(ir->index_block_size);
+	if (block_size < NTFS_BLOCK_SIZE) {
 		err = -EINVAL;
-		antfs_log_error("Index block size (%d) is smaller than the "
-				"sector size (%d)", icx->block_size,
+		antfs_log_error("Index block size (0x%x) is smaller than the "
+				"sector size (0x%x)", (int)block_size,
 				NTFS_BLOCK_SIZE);
 		goto err_out;
 	}
 
-	if (ni->vol->cluster_size <= icx->block_size)
+	if (block_size & (block_size - 1)) {
+		err = -EINVAL;
+		antfs_log_error("Index block size (0x%x) is not power of 2.",
+				(int)block_size);
+		goto err_out;
+	}
+
+	icx->block_size_bits = __ffs(block_size);
+
+	if (ni->vol->cluster_size <= block_size)
 		icx->vcn_size_bits = ni->vol->cluster_size_bits;
 	else
 		icx->vcn_size_bits = NTFS_BLOCK_SIZE_BITS;
@@ -793,7 +803,7 @@ int ntfs_index_lookup(const void *key, const int key_len,
 		goto err_out;
 	}
 
-	ib = ntfs_malloc(icx->block_size);
+	ib = ntfs_malloc(block_size);
 	if (!ib) {
 		err = -ENOMEM;
 		goto err_out;
@@ -923,14 +933,12 @@ static struct INDEX_ENTRY *ntfs_ie_get_median(struct INDEX_HEADER *ih)
 
 static s64 ntfs_ibm_vcn_to_pos(struct ntfs_index_context *icx, VCN vcn)
 {
-	uint64_t res = (uint64_t) ntfs_ib_vcn_to_pos(icx, vcn);
-	do_div(res, icx->block_size);
-	return res;
+	return ntfs_ib_vcn_to_pos(icx, vcn) >> icx->block_size_bits;
 }
 
 static s64 ntfs_ibm_pos_to_vcn(struct ntfs_index_context *icx, s64 pos)
 {
-	return ntfs_ib_pos_to_vcn(icx, pos * icx->block_size);
+	return ntfs_ib_pos_to_vcn(icx, pos << icx->block_size_bits);
 }
 
 /**
@@ -969,11 +977,12 @@ static int ntfs_ibm_add(struct ntfs_index_context *icx)
  */
 static int ntfs_ibm_modify(struct ntfs_index_context *icx, VCN vcn, int set)
 {
-	u8 byte;
+	u8 byte[8] = {0};
 	s64 pos = ntfs_ibm_vcn_to_pos(icx, vcn);
 	u32 bpos = pos / 8;
 	u32 bit = 1 << (pos % 8);
 	struct ntfs_attr *na;
+	int to_write = 1;
 	int err;
 
 	antfs_log_enter("%s vcn: %lld", set ? "set" : "clear", (long long)vcn);
@@ -985,6 +994,10 @@ static int ntfs_ibm_modify(struct ntfs_index_context *icx, VCN vcn, int set)
 	}
 
 	if (set && (na->data_size < bpos + 1)) {
+		/* write up to 8 bytes so initialized_size is always the same as
+		 * data_size. chkdsk will complain otherwise
+		 */
+		to_write = 8 - (na->data_size & 7);
 		err = ntfs_attr_truncate(na, (na->data_size + 8) & ~7);
 		if (err != 0) {
 			/* Always make this an error. */
@@ -995,19 +1008,19 @@ static int ntfs_ibm_modify(struct ntfs_index_context *icx, VCN vcn, int set)
 		}
 	}
 
-	err = ntfs_attr_pread(na, bpos, 1, &byte);
+	err = ntfs_attr_pread(na, bpos, 1, byte);
 	if (err != 1) {
 		antfs_log_error("Failed to read $BITMAP");
 		goto err_na;
 	}
 
 	if (set)
-		byte |= bit;
+		byte[0] |= bit;
 	else
-		byte &= ~bit;
+		byte[0] &= ~bit;
 
-	err = ntfs_attr_pwrite(na, bpos, 1, &byte);
-	if (err != 1) {
+	err = ntfs_attr_pwrite(na, bpos, to_write, byte);
+	if (err != to_write) {
 		antfs_log_error("Failed to write $Bitmap");
 		goto err_na;
 	}
@@ -1147,7 +1160,7 @@ static int ntfs_ib_copy_tail(struct ntfs_index_context *icx,
 
 	antfs_log_enter();
 
-	dst = ntfs_ib_alloc(new_vcn, icx->block_size,
+	dst = ntfs_ib_alloc(new_vcn, 1 << icx->block_size_bits,
 			    src->index.ih_flags & NODE_MASK);
 	if (!dst)
 		return -ENOMEM;
@@ -1555,7 +1568,7 @@ static int ntfs_ib_insert(struct ntfs_index_context *icx,
 
 	antfs_log_enter("Entering for new_vcn %lld", new_vcn);
 
-	ib = ntfs_malloc(icx->block_size);
+	ib = ntfs_malloc(1 << icx->block_size_bits);
 	if (!ib) {
 		antfs_log_error("ntfs_malloc failed");
 		return -ENOMEM;
@@ -1883,7 +1896,7 @@ static int ntfs_index_rm_leaf(struct ntfs_index_context *icx)
 	if (ntfs_icx_parent_vcn(icx) == VCN_INDEX_ROOT_PARENT)
 		parent_ih = &icx->ir->index;
 	else {
-		ib = ntfs_malloc(icx->block_size);
+		ib = ntfs_malloc(1 << icx->block_size_bits);
 		if (!ib)
 			return -ENOMEM;
 
@@ -1945,7 +1958,7 @@ static int ntfs_index_rm_node(struct ntfs_index_context *icx)
 		}
 	}
 
-	ib = ntfs_malloc(icx->block_size);
+	ib = ntfs_malloc(1 << icx->block_size_bits);
 	if (!ib)
 		return -ENOMEM;
 
@@ -2174,7 +2187,7 @@ static struct INDEX_ENTRY *ntfs_index_walk_down(struct INDEX_ENTRY *ie,
 
 			ictx->ir = NULL;
 			ictx->ib = (struct INDEX_BLOCK *)
-				ntfs_malloc(ictx->block_size);
+				ntfs_malloc(1 << ictx->block_size_bits);
 			if (!ictx->ib)
 				return NULL;
 			ictx->pindex = 1;

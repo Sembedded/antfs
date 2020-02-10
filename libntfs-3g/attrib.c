@@ -129,7 +129,7 @@ s64 ntfs_get_attribute_value(const struct ntfs_volume *vol,
 			     const struct ATTR_RECORD *a, u8 *b)
 {
 	struct runlist_element *rl;
-	s64 total, r, ret = 0;
+	s64 total, r, data_size, ret = 0;
 	int i;
 
 	/* Sanity checks. */
@@ -192,93 +192,34 @@ s64 ntfs_get_attribute_value(const struct ntfs_volume *vol,
 	 * FIXED2:  We were also overflowing here in the same fashion
 	 * when the data_size was more than one run smaller than the
 	 * allocated size which happens with Windows XP sometimes.
+	 * FIXUP: The proposed temporary fix was rather ... rough.
+	 * Duplicated a lot of code, needed an extra buffer ...
+	 * FIXED3: Respect sparse runs (LCN_HOLE).
 	 */
+	data_size = sle64_to_cpu(a->data_size);
 	/* Now load all clusters in the runlist into b. */
 	for (i = 0, total = 0; rl[i].length; i++) {
-		if (total + (rl[i].length << vol->cluster_size_bits) >=
-		    sle64_to_cpu(a->data_size)) {
-			unsigned char *intbuf = NULL;
-			/*
-			 * We have reached the last run so we were going to
-			 * overflow when executing the ntfs_pread() which is
-			 * BAAAAAAAD!
-			 * Temporary fix:
-			 *      Allocate a new buffer with size:
-			 *      rl[i].length << vol->cluster_size_bits, do the
-			 *      read into our buffer, then memcpy the correct
-			 *      amount of data into the caller supplied buffer,
-			 *      free our buffer, and continue.
-			 * We have reached the end of data size so we were
-			 * going to overflow in the same fashion.
-			 * Temporary fix:  same as above.
-			 */
-			intbuf =
-			    ntfs_malloc(rl[i].length << vol->cluster_size_bits);
-			if (!intbuf) {
-				ntfs_free(rl);
-				/* - ret is zero - */
-				goto out;
-			}
-			/*
-			 * FIXME: If compressed file: Only read if lcn != -1.
-			 * Otherwise, we are dealing with a sparse run and we
-			 * just memset the user buffer to 0 for the length of
-			 * the run, which should be 16 (= compression unit
-			 * size).
-			 * FIXME: Really only when file is compressed, or can
-			 * we have sparse runs in uncompressed files as well?
-			 * - Yes we can, in sparse files! But not necessarily
-			 * size of 16, just run length.
-			 */
-			r = ntfs_pread(vol->dev, rl[i].lcn <<
-				       vol->cluster_size_bits, rl[i].length <<
-				       vol->cluster_size_bits, intbuf);
-			if (r != rl[i].length << vol->cluster_size_bits) {
-#define ESTR "Error reading attribute value"
-				if (r < 0) {
-					antfs_log_error(ESTR);
-					ret = r;
-				} else if (r < rl[i].length <<
-					 vol->cluster_size_bits) {
-					antfs_log_debug(ESTR
-							": Ran out of input data.");
-					ret = -EIO;
-				} else {
-					antfs_log_debug(ESTR
-							": unknown error");
-					ret = -EIO;
-				}
-#undef ESTR
-				ntfs_free(rl);
-				ntfs_free(intbuf);
-				/* - ret is zero - */
-				goto out;
-			}
-			memcpy(b + total, intbuf, sle64_to_cpu(a->data_size) -
-			       total);
-			ntfs_free(intbuf);
-			total = sle64_to_cpu(a->data_size);
-			break;
+		s64 to_read;
+
+		/* Make sure we don't overflow. */
+		to_read = rl[i].length << vol->cluster_size_bits;
+		if (total + to_read > data_size)
+			to_read = data_size - total;
+		if (rl[i].lcn == LCN_HOLE) {
+			memset(b + total, 0, to_read);
+			r = to_read;
+		} else {
+			r = ntfs_pread(vol->dev,
+					rl[i].lcn << vol->cluster_size_bits,
+					to_read,
+					b + total);
 		}
-		/*
-		 * FIXME: If compressed file: Only read if lcn != -1.
-		 * Otherwise, we are dealing with a sparse run and we just
-		 * memset the user buffer to 0 for the length of the run, which
-		 * should be 16 (= compression unit size).
-		 * FIXME: Really only when file is compressed, or can
-		 * we have sparse runs in uncompressed files as well?
-		 * - Yes we can, in sparse files! But not necessarily size of
-		 * 16, just run length.
-		 */
-		r = ntfs_pread(vol->dev, rl[i].lcn << vol->cluster_size_bits,
-			       rl[i].length << vol->cluster_size_bits,
-			       b + total);
-		if (r != rl[i].length << vol->cluster_size_bits) {
+		if (r != to_read) {
 #define ESTR "Error reading attribute value"
 			if (r < 0) {
 				antfs_log_error(ESTR);
 				ret = r;
-			} else if (r < rl[i].length << vol->cluster_size_bits) {
+			} else if (r < to_read) {
 				antfs_log_debug(ESTR
 						": Ran out of input data.");
 				ret = -EIO;
@@ -530,7 +471,7 @@ static int ntfs_attr_fill(struct ntfs_inode *ni, struct ntfs_attr *na,
 	}
 	ntfs_attr_put_search_ctx(ctx);
 out:
-	antfs_log_leave("err: %d", (int)PTR_ERR(na));
+	antfs_log_leave("err: %d", err);
 	return err;
 
 err_out_put:
@@ -1424,16 +1365,16 @@ static int ntfs_attr_fill_hole(struct ntfs_attr *na, s64 count, s64 *ofs,
 			goto err_out;
 		}
 		rlc = ntfs_cluster_alloc(vol, alloc_vcn, need,
-					 lcn_seek_from, DATA_ZONE);
+					 lcn_seek_from, DATA_ZONE,
+					 na->data_size);
 	} else
 		rlc = ntfs_cluster_alloc(vol, from_vcn, need,
-					 lcn_seek_from, DATA_ZONE);
+					 lcn_seek_from, DATA_ZONE,
+					 na->data_size);
 	if (IS_ERR_OR_NULL(rlc)) {
 		ret = -EIO;
 		goto err_out;
 	}
-	if (na->data_flags & (ATTR_COMPRESSION_MASK | ATTR_IS_SPARSE))
-		na->compressed_size += need << vol->cluster_size_bits;
 
 	*rl = ntfs_runlists_merge(na->rl, rlc);
 	NAttrSetRunlistDirty(na);
@@ -1505,6 +1446,8 @@ static int ntfs_attr_fill_hole(struct ntfs_attr *na, s64 count, s64 *ofs,
 		 */
 		*ofs -= ((*rl)->vcn - cur_vcn) << vol->cluster_size_bits;
 	}
+	if (na->data_flags & (ATTR_COMPRESSION_MASK | ATTR_IS_SPARSE))
+		na->compressed_size += need << vol->cluster_size_bits;
 err_out:
 	return ret;
 }
@@ -1846,8 +1789,6 @@ static int borrow_from_hole(struct ntfs_attr *na, struct runlist_element **prl,
 	return compressed_part;
 }
 
-static int ntfs_attr_truncate_i(struct ntfs_attr *na, const s64 newsize,
-				enum hole_type holes);
 
 /**
  * ntfs_attr_pwrite - positioned write to an ntfs attribute
@@ -2440,8 +2381,7 @@ err_out:
 			 * old_initialized_size -> new_initialized_size with
 			 * data or at least zeroes. (AIA)
 			 */
-			antfs_logger(((struct antfs_sb_info *)
-					vol->dev->d_sb->s_fs_info)->logger,
+			antfs_logger(vol->dev->d_sb->s_id,
 					"Eeek! Failed to recover from "
 					"error. Leaving metadata in "
 					"inconsistent state! Run chkdsk!");
@@ -2513,15 +2453,16 @@ int ntfs_attr_pclose(struct ntfs_attr *na)
 	int compressed_part;
 	int compressed = 0;
 
-	antfs_log_enter("Entering for inode 0x%llx, attr 0x%x.",
-			(unsigned long long)na->ni->mft_no,
-			le32_to_cpu(na->type));
-
 	if (!na || !na->ni || !na->ni->vol) {
 		err = -EINVAL;
 		antfs_log_error("Wrong arguments");
 		goto err_set;
 	}
+
+	antfs_log_enter("Entering for inode 0x%llx, attr 0x%x.",
+			(unsigned long long)na->ni->mft_no,
+			le32_to_cpu(na->type));
+
 	vol = na->ni->vol;
 	na->unused_runs = 0;
 	compressed = (na->data_flags & ATTR_COMPRESSION_MASK)
@@ -2690,11 +2631,11 @@ err_set:
 
 /**
  * ntfs_attr_mst_pread - multi sector transfer protected ntfs attribute read
- * @na:		multi sector transfer protected ntfs attribute to read from
- * @pos:	byte position in the attribute to begin reading from
- * @bk_cnt:	number of mst protected blocks to read
- * @bk_size:	size of each mst protected block in bytes
- * @dst:	output data buffer
+ * @na:           multi sector transfer protected ntfs attribute to read from
+ * @pos:          byte position in the attribute to begin reading from
+ * @bk_cnt:       number of mst protected blocks to read
+ * @bk_size_bits: bit shift size of each mst protected block in bytes
+ * @dst:          output data buffer
  *
  * This function will read @bk_cnt blocks of size @bk_size bytes each starting
  * at offset @pos from the ntfs attribute @na into the data buffer @b.
@@ -2717,44 +2658,46 @@ err_set:
  * errors can be repaired.
  */
 s64 ntfs_attr_mst_pread(struct ntfs_attr *na, const s64 pos, const s64 bk_cnt,
-			const u32 bk_size, void *dst, bool warn_ov)
+			const u8 bk_size_bits, void *dst, bool warn_ov)
 {
-	uint64_t br;
+	s64 br;
 	u8 *end;
-	bool warn, did_lock = false;
+	bool warn;
 
 	antfs_log_enter("inode 0x%llx, attr type 0x%x, pos 0x%llx.",
 			(unsigned long long)na->ni->mft_no,
 			le32_to_cpu(na->type), (long long)pos);
-	if (bk_cnt < 0 || bk_size % NTFS_BLOCK_SIZE) {
+	if (bk_cnt < 0 || bk_size_bits < NTFS_BLOCK_SIZE_BITS) {
 		antfs_log_error("Wrong arguments");
 		return -EINVAL;
 	}
-	if (mutex_trylock(&na->ni->ni_lock)) {
-		if (na->ni->mft_no >= FILE_FIRST_USER)
-			antfs_log_error("Trying to read attr of unlocked USR "
-					"inode %lld (ni=%p); type: 0x%02x; ",
-					(long long)na->ni->mft_no,
-					na->ni, le32_to_cpu(na->type));
-		did_lock = true;
-	}
+	/* Just use this as a global lock for everything not user. */
+	br = (s64)ntfs_mftbmp_lock(na->ni->vol);
+	if (br)
+		goto out_nolock;
 
-	br = ntfs_attr_pread(na, pos, bk_cnt * bk_size, dst);
+	br = ntfs_attr_pread(na, pos, bk_cnt << bk_size_bits, dst);
 	if (br <= 0)
 		goto out;
 
-	do_div(br, bk_size);
+	br >>= bk_size_bits;
 	/* log errors unless silenced */
 	if (warn_ov)
 		warn = !na->ni || !na->ni->vol || !NVolNoFixupWarn(na->ni->vol);
 	else
 		warn = false;
 
-	for (end = (u8 *) dst + br * bk_size; (u8 *) dst < end;
-	     dst = (u8 *) dst + bk_size) {
+	/* ntfs-3g warns about but otherwise IGNOREs mst errors here.
+	 * This is important to prevent endless error loops when allocating mft
+	 * records. We also ignore errors in this case, but not on other
+	 * occasions!
+	 */
+	for (end = (u8 *) dst + (br << bk_size_bits); (u8 *) dst < end;
+	     dst = (u8 *) dst + (1 << bk_size_bits)) {
 		int err = ntfs_mst_post_read_fixup_warn((struct NTFS_RECORD *)
-				dst, bk_size, warn);
-		if (err) {
+				dst, 1 << bk_size_bits, warn);
+
+		if (err && warn_ov) {
 			br = (s64)err;
 			goto out;
 		}
@@ -2762,19 +2705,19 @@ s64 ntfs_attr_mst_pread(struct ntfs_attr *na, const s64 pos, const s64 bk_cnt,
 
 	/* Finally, return the number of blocks read. */
 out:
-	if (did_lock)
-		mutex_unlock(&na->ni->ni_lock);
+	ntfs_mftbmp_unlock(na->ni->vol);
+out_nolock:
 	antfs_log_leave();
 	return br;
 }
 
 /**
  * ntfs_attr_mst_pwrite - multi sector transfer protected ntfs attribute write
- * @na:		multi sector transfer protected ntfs attribute to write to
- * @pos:	position in the attribute to write to
- * @bk_cnt:	number of mst protected blocks to write
- * @bk_size:	size of each mst protected block in bytes
- * @src:	data buffer to write to disk
+ * @na:           multi sector transfer protected ntfs attribute to write to
+ * @pos:          position in the attribute to write to
+ * @bk_cnt:       number of mst protected blocks to write
+ * @bk_size_bits: bit shift size of each mst protected block in bytes
+ * @src:          data buffer to write to disk
  *
  * This function will write @bk_cnt blocks of size @bk_size bytes each from
  * data buffer @b to multi sector transfer (mst) protected ntfs attribute @na
@@ -2798,43 +2741,37 @@ out:
  * achieved.
  */
 s64 ntfs_attr_mst_pwrite(struct ntfs_attr *na, const s64 pos, s64 bk_cnt,
-			 const u32 bk_size, void *src)
+			 const u8 bk_size_bits, void *src)
 {
 	s64 i, ret = 0;
-	uint64_t written;
-	bool did_lock = false;
 
 	/* Note na->ni->mft_no is 0 here when we come from
 	 * ntfs_mft_record_init. */
 	antfs_log_enter
 	    ("Entering for inode 0x%llx, attr type 0x%x, pos 0x%llx "
-	     "bk_cnt 0x%llx, bk_size 0x%x",
+	     "bk_cnt 0x%llx, bk_size_bits 0x%x",
 	     (unsigned long long)na->ni->mft_no, le32_to_cpu(na->type),
-	     (long long)pos, (long long)bk_cnt, (unsigned int)bk_size);
-	if (bk_cnt < 0 || bk_size % NTFS_BLOCK_SIZE || !src) {
+	     (long long)pos, (long long)bk_cnt, (unsigned int)bk_size_bits);
+	if (bk_cnt < 0 || bk_size_bits < NTFS_BLOCK_SIZE_BITS || !src) {
 		antfs_log_error("EINVAL");
 		ret = -EINVAL;
-		goto out;
+		goto out_nolock;
 	}
 	if (!bk_cnt)
-		goto out;
-	if (mutex_trylock(&na->ni->ni_lock)) {
-		if (na->ni->mft_no >= FILE_FIRST_USER)
-			antfs_log_error("Trying to write out attr of unlocked "
-					"USR inode %lld (ni=%p); "
-					"type: 0x%02x",
-					(long long)na->ni->mft_no,
-					na->ni, le32_to_cpu(na->type));
-		did_lock = true;
-	}
+		goto out_nolock;
+	/* Just use this as a global lock for everything not user. */
+	ret = (s64)ntfs_mftbmp_lock(na->ni->vol);
+	if (ret)
+		goto out_nolock;
 
 	/* Prepare data for writing. */
 	for (i = 0; i < bk_cnt; ++i) {
 		int err;
 
 		err = ntfs_mst_pre_write_fixup((struct NTFS_RECORD *)
-					       ((u8 *) src + i * bk_size),
-					       bk_size);
+					       ((u8 *) src +
+						(i << bk_size_bits)),
+					       1 << bk_size_bits);
 		if (err < 0) {
 			/* Abort write at this position. */
 			antfs_log_error("#1");
@@ -2847,22 +2784,20 @@ s64 ntfs_attr_mst_pwrite(struct ntfs_attr *na, const s64 pos, s64 bk_cnt,
 		}
 	}
 	/* Write the prepared data. */
-	ret = ntfs_attr_pwrite(na, pos, bk_cnt * bk_size, src);
+	ret = ntfs_attr_pwrite(na, pos, bk_cnt << bk_size_bits, src);
 	if (ret <= 0)
 		antfs_log_error("written=%lld", (long long)ret);
 	/* Quickly deprotect the data again. */
 	for (i = 0; i < bk_cnt; ++i)
 		ntfs_mst_post_write_fixup((struct NTFS_RECORD *) ((u8 *) src +
-						i * bk_size));
+						(i << bk_size_bits)));
 	if (ret <= 0)
 		goto out;
-	written = ret;
 	/* Finally, return the number of complete blocks written. */
-	do_div(written, bk_size);
-	ret = written;
+	ret >>= bk_size_bits;
 out:
-	if (did_lock)
-		mutex_unlock(&na->ni->ni_lock);
+	ntfs_mftbmp_unlock(na->ni->vol);
+out_nolock:
 	antfs_log_leave("written=%lld", (long long)ret);
 	return ret;
 }
@@ -4121,16 +4056,16 @@ int ntfs_non_resident_attr_record_add(struct ntfs_inode *ni,
 	struct ntfs_inode *base_ni;
 	int err, offset;
 
+	if (!ni || dataruns_size <= 0 || (!name && name_len)) {
+		antfs_log_error("Invalid arguments");
+		return -EINVAL;
+	}
+
 	antfs_log_enter("inode 0x%llx, attr 0x%x, lowest_vcn %lld, "
 			"dataruns_size %d, flags 0x%x.",
 			(long long)ni->mft_no, (unsigned)le32_to_cpu(type),
 			(long long)lowest_vcn, dataruns_size,
 			(unsigned)le16_to_cpu(flags));
-
-	if (!ni || dataruns_size <= 0 || (!name && name_len)) {
-		antfs_log_error("Invalid arguments");
-		return -EINVAL;
-	}
 
 	err = ntfs_attr_can_be_non_resident(ni->vol, type, name, name_len);
 	if (err) {
@@ -4283,8 +4218,7 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx)
 		     "record.");
 		if (NInoAttrList(base_ni) && type != AT_ATTRIBUTE_LIST)
 			if (ntfs_attrlist_entry_add(ni, ctx->attr)) {
-				antfs_logger( ((struct antfs_sb_info *)
-					 ANTFS_I(ni)->i_sb->s_fs_info)->logger,
+				antfs_logger(ANTFS_I(ni)->i_sb->s_id,
 					"Rollback failed. Leaving "
 					"inconsistent metadata.");
 			}
@@ -4356,9 +4290,7 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx)
 				return 0;
 			}
 			if (ntfs_cluster_free_from_rl(base_ni->vol, al_rl)) {
-				antfs_logger( ((struct antfs_sb_info *)
-					     ANTFS_I(base_ni)->i_sb->s_fs_info)
-					    ->logger,
+				antfs_logger(ANTFS_I(base_ni)->i_sb->s_id,
 					    "Leaking clusters! Run chkdsk."
 					    " couldn't free clusters from "
 					    "attribute list runlist.");
@@ -4609,8 +4541,7 @@ rm_attr_err_out:
 	/* Remove just added attribute. */
 	if (ntfs_attr_record_resize(attr_ni->mrec, (struct ATTR_RECORD *)
 				    ((u8 *) attr_ni->mrec + offset), 0)) {
-		antfs_logger(((struct antfs_sb_info *)
-				ANTFS_I(attr_ni)->i_sb->s_fs_info)->logger,
+		antfs_logger(ANTFS_I(attr_ni)->i_sb->s_id,
 				"Failed to remove just added attribute #2");
 	}
 free_err_out:
@@ -4639,14 +4570,14 @@ int ntfs_attr_rm(struct ntfs_attr *na)
 	struct ntfs_attr_search_ctx *ctx;
 	int ret = 0;
 
-	antfs_log_enter("Entering for inode 0x%llx, attr 0x%x.",
-			(long long)na->ni->mft_no, le32_to_cpu(na->type));
-
 	if (!na) {
 		antfs_log_error("Invalid arguments passed.");
 		ret = -EINVAL;
 		goto out;
 	}
+
+	antfs_log_enter("Entering for inode 0x%llx, attr 0x%x.",
+			(long long)na->ni->mft_no, le32_to_cpu(na->type));
 
 	/* Free cluster allocation. */
 	if (NAttrNonResident(na)) {
@@ -4655,8 +4586,7 @@ int ntfs_attr_rm(struct ntfs_attr *na)
 			return ret;
 		ret = ntfs_cluster_free(na->ni->vol, na, 0, -1);
 		if (ret < 0) {
-			antfs_logger(((struct antfs_sb_info *)
-				    ANTFS_I(na->ni)->i_sb->s_fs_info)->logger,
+			antfs_logger(ANTFS_I(na->ni)->i_sb->s_id,
 				    "Failed to free cluster allocation. "
 				    "Leaving inconsistent metadata.");
 		}
@@ -4672,8 +4602,7 @@ int ntfs_attr_rm(struct ntfs_attr *na)
 					CASE_SENSITIVE, 0, NULL, 0, ctx))) {
 		ret = ntfs_attr_record_rm(ctx);
 		if (ret) {
-			antfs_logger(((struct antfs_sb_info *)
-				    ANTFS_I(na->ni)->i_sb->s_fs_info)->logger,
+			antfs_logger(ANTFS_I(na->ni)->i_sb->s_id,
 				    "Failed to remove attribute extent. "
 				    "Leaving inconsistent metadata");
 		}
@@ -4681,8 +4610,7 @@ int ntfs_attr_rm(struct ntfs_attr *na)
 	}
 	ntfs_attr_put_search_ctx(ctx);
 	if (ret != -ENOENT) {
-		antfs_logger(((struct antfs_sb_info *)
-				ANTFS_I(na->ni)->i_sb->s_fs_info)->logger,
+		antfs_logger(ANTFS_I(na->ni)->i_sb->s_id,
 				"Attribute lookup failed. Probably leaving"
 				" inconsistent metadata");
 	} else
@@ -4730,23 +4658,26 @@ int ntfs_attr_record_resize(struct MFT_RECORD *m, struct ATTR_RECORD *a,
 
 		u32 new_muse = old_size - attr_size + new_size;
 
-		/* Not enough space in this mft record. */
-		if (new_muse > alloc_size) {
-			/* TODO this is meant to be an error but different than
-			 * the next one just below us?*/
-			err = -ENOSPC;
-			/* Nothing to be THAT much worried about here. */
-			antfs_log_debug("Not enough space in the MFT record "
-				       "(0x%x > 0x%x)", new_muse, alloc_size);
+		/* STATUS_RESIDENT_ATTRIBUTE_FILLED_MFT will cause
+		 * ntfs_ir_make_space() to create an INDEX_ALLOCATION attribute
+		 * instead of moving INDEX_ROOT to an extent.
+		 */
+		if (a->type == AT_INDEX_ROOT && new_size > attr_size &&
+		    new_muse + 120 > alloc_size) {
+			err = STATUS_RESIDENT_ATTRIBUTE_FILLED_MFT;
+			if (old_size + 120 > alloc_size) {
+				antfs_log_debug("Too big INDEX_ROOT (%u > %u)",
+						new_muse + 120, alloc_size);
+			}
 			goto out;
 		}
 
-		if (a->type == AT_INDEX_ROOT && new_size > attr_size &&
-		    new_muse + 120 > alloc_size
-		    && old_size + 120 <= alloc_size) {
-			err = STATUS_RESIDENT_ATTRIBUTE_FILLED_MFT;
-			antfs_log_debug("Too big INDEX_ROOT (%u > %u)",
-					new_muse, alloc_size);
+		/* Not enough space in this mft record. */
+		if (new_muse > alloc_size) {
+			err = -ENOSPC;
+			/* Nothing to be THAT much worried about here. */
+			antfs_log_debug("Not enough space in the MFT record "
+					"(%u > %u) type %x", new_muse, alloc_size, a->type);
 			goto out;
 		}
 
@@ -4828,17 +4759,17 @@ int ntfs_attr_record_move_to(struct ntfs_attr_search_ctx *ctx,
 	struct ATTR_RECORD *a;
 	int err = 0;
 
-	antfs_log_enter
-	    ("ctx->attr->type 0x%x, ctx->ntfs_ino->mft_no "
-	     "0x%llx, ni->mft_no 0x%llx.",
-	     (unsigned)le32_to_cpu(ctx->attr->type),
-	     (long long)ctx->ntfs_ino->mft_no, (long long)ni->mft_no);
-
 	if (!ctx || !ctx->attr || !ctx->ntfs_ino || IS_ERR_OR_NULL(ni)) {
 		antfs_log_error("Invalid arguments passed.");
 		err = -EINVAL;
 		goto out;
 	}
+
+	antfs_log_enter
+	    ("ctx->attr->type 0x%x, ctx->ntfs_ino->mft_no "
+	     "0x%llx, ni->mft_no 0x%llx.",
+	     (unsigned)le32_to_cpu(ctx->attr->type),
+	     (long long)ctx->ntfs_ino->mft_no, (long long)ni->mft_no);
 
 	if (ctx->ntfs_ino == ni)
 		goto out;
@@ -4930,16 +4861,16 @@ int ntfs_attr_record_move_away(struct ntfs_attr_search_ctx *ctx, int extra)
 	struct MFT_RECORD *m;
 	int i, err = 0;
 
-	antfs_log_enter("attr 0x%x, inode %llu",
-			(unsigned)le32_to_cpu(ctx->attr->type),
-			(unsigned long long)ctx->ntfs_ino->mft_no);
-
 	if (!ctx || !ctx->attr || !ctx->ntfs_ino || extra < 0) {
 		antfs_log_error("ctx=%p ctx->attr=%p extra=%d",
 				ctx, ctx ? ctx->attr : NULL, extra);
 		err = -EINVAL;
 		goto out;
 	}
+
+	antfs_log_enter("attr 0x%x, inode %llu",
+			(unsigned)le32_to_cpu(ctx->attr->type),
+			(unsigned long long)ctx->ntfs_ino->mft_no);
 
 	if (ctx->ntfs_ino->nr_extents == -1)
 		base_ni = ctx->base_ntfs_ino;
@@ -5087,7 +5018,8 @@ int ntfs_attr_make_non_resident(struct ntfs_attr *na,
 		}
 		/* Start by allocating clusters to hold the attribute value. */
 		rl = ntfs_cluster_alloc(vol, 0, new_allocated_size >>
-					vol->cluster_size_bits, -1, DATA_ZONE);
+					vol->cluster_size_bits, -1, DATA_ZONE,
+					0);
 		if (IS_ERR_OR_NULL(rl)) {
 			err = PTR_ERR(rl);
 			goto out;
@@ -5221,8 +5153,7 @@ int ntfs_attr_make_non_resident(struct ntfs_attr *na,
 				     rl, 0, NULL) < 0;
 	if (err) {
 		/* FIXME: Eeek! We need rollback! (AIA) */
-		antfs_logger(((struct antfs_sb_info *)
-			    vol->dev->d_sb->s_fs_info)->logger,
+		antfs_logger(vol->dev->d_sb->s_id,
 			    "Eeek! Failed to build mapping pairs. Leaving "
 			    "corrupt attribute record on disk. In memory "
 			    "runlist is still intact! Error code is %i. FIXME: "
@@ -5236,8 +5167,7 @@ out:
 
 cluster_free_err_out:
 	if (rl && ntfs_cluster_free(vol, na, 0, -1) < 0) {
-		antfs_logger(((struct antfs_sb_info *)
-				vol->dev->d_sb->s_fs_info)->logger,
+		antfs_logger(vol->dev->d_sb->s_id,
 				"Eeek! Failed to release allocated "
 				"clusters in error code path. Leaving "
 				"inconsistent metadata...");
@@ -5545,6 +5475,7 @@ static int ntfs_attr_update_meta(struct ATTR_RECORD *a, struct ntfs_attr *na,
 				 struct ntfs_attr_search_ctx *ctx)
 {
 	int sparse, err = 0;
+	bool sparse_changed = false;
 
 	antfs_log_enter("inode 0x%llx, attr 0x%x",
 			(unsigned long long)na->ni->mft_no,
@@ -5624,6 +5555,7 @@ static int ntfs_attr_update_meta(struct ATTR_RECORD *a, struct ntfs_attr *na,
 
 		a->mapping_pairs_offset =
 		    cpu_to_le16(le16_to_cpu(a->mapping_pairs_offset) + 8);
+		sparse_changed = true;
 	}
 
 	/* Attribute no longer sparse. */
@@ -5647,8 +5579,11 @@ static int ntfs_attr_update_meta(struct ATTR_RECORD *a, struct ntfs_attr *na,
 		    cpu_to_le16(le16_to_cpu(a->mapping_pairs_offset) - 8);
 	}
 
-	/* Update compressed size if required. */
-	if (NAttrFullyMapped(na)
+	/* Initialize compressed size if required (attribute was not sparse
+	 * before but is now).
+	 */
+	if (sparse_changed
+	    && NAttrFullyMapped(na)
 	    && (sparse || (na->data_flags & ATTR_COMPRESSION_MASK))) {
 		s64 new_compr_size;
 
@@ -5975,7 +5910,8 @@ retry:
 			    & (ATTR_IS_COMPRESSED | ATTR_IS_SPARSE);
 			if (spcomp)
 				a->compressed_size =
-				    cpu_to_sle64(na->compressed_size);
+					cpu_to_sle64(na->compressed_size);
+
 			if ((na->type == AT_DATA) && (na->name == AT_UNNAMED))
 				NInoFileNameSetDirty(na->ni);
 		} else {
@@ -6202,14 +6138,16 @@ static int ntfs_non_resident_attr_shrink(struct ntfs_attr *na,
 		nr_freed_clusters = ntfs_cluster_free(vol, na, first_free_vcn,
 						      -1);
 		if (nr_freed_clusters < 0) {
-			antfs_logger(((struct antfs_sb_info *)
-				    vol->dev->d_sb->s_fs_info)->logger,
+			antfs_logger(vol->dev->d_sb->s_id,
 				    "Eeek! Freeing of clusters failed. "
 				    "Aborting...");
 			err = nr_freed_clusters;
 			goto out;
 		}
 
+		if (na->data_flags & (ATTR_COMPRESSION_MASK | ATTR_IS_SPARSE))
+			na->compressed_size -= nr_freed_clusters <<
+				vol->cluster_size_bits;
 		/* Truncate the runlist itself. */
 		err = ntfs_rl_truncate(&na->rl, first_free_vcn);
 		if (err) {
@@ -6230,8 +6168,7 @@ static int ntfs_non_resident_attr_shrink(struct ntfs_attr *na,
 		/* Write mapping pairs for new runlist. */
 		err = ntfs_attr_update_mapping_pairs(na, 0/*first_free_vcn */);
 		if (err) {
-			antfs_logger(((struct antfs_sb_info *)
-				    vol->dev->d_sb->s_fs_info)->logger,
+			antfs_logger(vol->dev->d_sb->s_id,
 				    "Eeek! Mapping pairs update failed. "
 				    "Leaving inconsistent metadata. Run "
 				    "chkdsk");
@@ -6249,8 +6186,7 @@ static int ntfs_non_resident_attr_shrink(struct ntfs_attr *na,
 	err = ntfs_attr_lookup(na->type, na->name, na->name_len, CASE_SENSITIVE,
 			       0, NULL, 0, ctx);
 	if (err) {
-		antfs_logger(((struct antfs_sb_info *)
-				vol->dev->d_sb->s_fs_info)->logger,
+		antfs_logger(vol->dev->d_sb->s_id,
 				"Eeek! Lookup of first attribute extent "
 				"failed. Leaving inconsistent metadata.");
 		if (err == -ENOENT)
@@ -6301,7 +6237,7 @@ static int ntfs_non_resident_attr_expand_i(struct ntfs_attr *na,
 	struct ntfs_volume *vol;
 	struct ntfs_attr_search_ctx *ctx;
 	struct runlist_element *rl, *rln;
-	s64 org_alloc_size;
+	s64 org_alloc_size, org_compr_size;
 	int err = 0;
 
 	antfs_log_enter("Inode %lld, attr 0x%x, new size %lld old size %lld",
@@ -6327,6 +6263,7 @@ static int ntfs_non_resident_attr_expand_i(struct ntfs_attr *na,
 		NAttrSetDataAppending(na);
 	/* Save for future use. */
 	org_alloc_size = na->allocated_size;
+	org_compr_size = na->compressed_size;
 	/* The first cluster outside the new allocation. */
 	first_free_vcn = (newsize + vol->cluster_size - 1) >>
 	    vol->cluster_size_bits;
@@ -6379,6 +6316,7 @@ static int ntfs_non_resident_attr_expand_i(struct ntfs_attr *na,
 			rl[1].lcn = LCN_ENOENT;
 			rl[1].length = 0;
 		} else {
+			s64 count;
 			/*
 			 * Determine first after last LCN of attribute.
 			 * We will start seek clusters from this LCN to avoid
@@ -6404,23 +6342,26 @@ static int ntfs_non_resident_attr_expand_i(struct ntfs_attr *na,
 					lcn_seek_from = rl->lcn + rl->length;
 			}
 
+			count = first_free_vcn - (na->allocated_size >>
+						  vol->cluster_size_bits);
 			rl = ntfs_cluster_alloc(vol, na->allocated_size >>
 						vol->cluster_size_bits,
-						first_free_vcn -
-						(na->allocated_size >> vol->
-						 cluster_size_bits),
-						lcn_seek_from, DATA_ZONE);
+						count,
+						lcn_seek_from, DATA_ZONE,
+						na->data_size);
 			if (IS_ERR(rl)) {
 				antfs_log_error("Cluster allocation failed "
 						"(%lld clusters, err=%d)",
-						(long long)first_free_vcn -
-						((long long)na->
-						 allocated_size >> vol->
-						 cluster_size_bits),
+						(long long)count,
 						(int)PTR_ERR(rl));
 				err = PTR_ERR(rl);
 				goto out;
 			}
+
+			if (na->data_flags & (ATTR_COMPRESSION_MASK |
+					      ATTR_IS_SPARSE))
+				na->compressed_size += count <<
+					vol->cluster_size_bits;
 		}
 
 		/* Append new clusters to attribute runlist. */
@@ -6514,6 +6455,9 @@ rollback:
 		NAttrSetRunlistDirty(na);
 		/* Prepare to mapping pairs update. */
 		na->allocated_size = org_alloc_size;
+		if (na->data_flags & (ATTR_COMPRESSION_MASK |
+				      ATTR_IS_SPARSE))
+			na->compressed_size = org_compr_size;
 		/* Restore mapping pairs. */
 		if (ntfs_attr_update_mapping_pairs(na, 0/*na->allocated_size >>
 			vol->cluster_size_bits*/)) {
@@ -6555,8 +6499,8 @@ static int ntfs_non_resident_attr_expand(struct ntfs_attr *na,
  *	EOPNOTSUPP - The desired resize is not implemented yet.
  *	EACCES	   - Encrypted attribute.
  */
-static int ntfs_attr_truncate_i(struct ntfs_attr *na, const s64 newsize,
-				enum hole_type holes)
+int ntfs_attr_truncate_i(struct ntfs_attr *na, const s64 newsize,
+			 enum hole_type holes)
 {
 	int ret = STATUS_ERROR;
 	s64 fullsize;
@@ -6572,7 +6516,8 @@ static int ntfs_attr_truncate_i(struct ntfs_attr *na, const s64 newsize,
 			(unsigned long long)na->ni->mft_no,
 			le32_to_cpu(na->type), (long long)newsize);
 
-	if (na->data_size == newsize) {
+	if (na->data_size == newsize &&
+	    !(na->allocated_size > 0 && newsize == 0)) {
 		antfs_log_leave("Size is already ok");
 		ret = STATUS_OK;
 		goto out;
@@ -6689,7 +6634,7 @@ int antfs_do_cluster_alloc(struct ntfs_inode *ni, struct ntfs_attr *na, VCN vcn,
 			   size_t count, LCN *res_lcn)
 {
 	VCN start_update;
-	LCN first_lcn;
+	LCN first_lcn, next_lcn;
 	s64 org_alloc_size = na->allocated_size;
 	struct runlist_element *rl, *tmp_rl;
 	struct ntfs_volume *vol = ni->vol;
@@ -6727,8 +6672,12 @@ int antfs_do_cluster_alloc(struct ntfs_inode *ni, struct ntfs_attr *na, VCN vcn,
 	}
 #endif
 
-	rl = ntfs_cluster_alloc(vol, vcn, count, rl_get_next_lcn(na->rl),
-				DATA_ZONE);
+	next_lcn = ntfs_rl_vcn_to_lcn(na->rl, vcn - 1) + 1;
+	if (next_lcn <= 0)
+		next_lcn = rl_get_next_lcn(na->rl);
+
+	rl = ntfs_cluster_alloc(vol, vcn, count, next_lcn,
+				DATA_ZONE, na->data_size);
 	if (IS_ERR_OR_NULL(rl)) {
 		err = PTR_ERR(rl);
 		goto err_out;
@@ -6740,7 +6689,11 @@ int antfs_do_cluster_alloc(struct ntfs_inode *ni, struct ntfs_attr *na, VCN vcn,
 	if (IS_ERR(tmp_rl)) {
 		err = PTR_ERR(tmp_rl);
 		antfs_log_error("Merging runlist failed: %d", err);
-		goto rollback;
+		if (ntfs_cluster_free_from_rl(vol, rl))
+			antfs_logger(vol->dev->d_sb->s_id,
+				     "ntfs_cluster_free_from_rl() failed");
+		ntfs_free(rl);
+		goto err_out;
 	}
 
 	na->rl = tmp_rl;
@@ -6766,6 +6719,9 @@ int antfs_do_cluster_alloc(struct ntfs_inode *ni, struct ntfs_attr *na, VCN vcn,
 		goto rollback;
 	}
 
+	if (na->data_flags & (ATTR_COMPRESSION_MASK | ATTR_IS_SPARSE))
+		na->compressed_size += count << vol->cluster_size_bits;
+
 	/* TODO: Is this correct (also see below)? */
 	NAttrClearDataAppending(na);
 	/* Data size is updated later (write_end?) */
@@ -6777,20 +6733,10 @@ rollback:
 	/* Free allocated clusters. */
 	if (ntfs_cluster_free(vol, na, org_alloc_size >> vol->cluster_size_bits,
 				-1) < 0) {
-		int tmp_err;
-
-		/* If the "clean way" fails, force cluster free and leave
-		 * na as is.
-		 */
 		antfs_log_error("Cluster free failed. rl in RAM damaged.");
-		update_full_status(vol, rl->lcn);
-		tmp_err = ntfs_lcn_bitmap_clear_run(vol, rl->lcn, rl->length);
-		if (tmp_err) {
-			antfs_logger(((struct antfs_sb_info *)
-				    vol->dev->d_sb->s_fs_info)->logger,
-				    "Leaking clusters.");
-			err = -EIO;
-		}
+		antfs_logger(vol->dev->d_sb->s_id,
+			     "Leaking clusters.");
+		err = -EIO;
 		/* Stuff in rl is garbage. Get rid of it. */
 		goto err_na;
 	}
@@ -6805,7 +6751,7 @@ err_na:
 		ntfs_free(na->rl);
 		na->rl = NULL;
 		NAttrClearFullyMapped(na);
-		antfs_log_error("Couldn't truncate runlist. "
+		antfs_logger(vol->dev->d_sb->s_id, "Couldn't truncate runlist. "
 				"Have to re-build it.");
 	} else {
 		NAttrSetRunlistDirty(na);
@@ -6814,8 +6760,7 @@ err_na:
 		/* Restore mapping pairs. */
 		if (ntfs_attr_update_mapping_pairs(na, 0/*na->allocated_size >>
 			vol->cluster_size_bits */)) {
-			antfs_logger(((struct antfs_sb_info *)
-				    vol->dev->d_sb->s_fs_info)->logger,
+			antfs_logger(vol->dev->d_sb->s_id,
 				    "Failed to restore old mapping pairs");
 		}
 	}
@@ -7028,15 +6973,17 @@ int ntfs_attr_remove(struct ntfs_inode *ni, const enum ATTR_TYPES type,
 
 	if (type == AT_DATA || type == AT_INDEX_ROOT) {
 		na = ANTFS_NA(ni);
-		/* TODO: This seems to happen! But it should not. Need to figure
-		 *       out why.
+		/* This ALWAYS happens on rollback in __ntfs_create as
+		 * na->ni here only gets set in antfs_inode_init which
+		 * is called later AFTER __ntfs_create is done.
+		 * Cannot use ANTFS_NA here at all!
+		 * So set na to NULL and open the attribute below.
 		 */
 		if (!na->ni) {
-			antfs_log_error("ino %llx na->ni is NULL!\n",
-					(long long)ni->mft_no);
 			na = NULL;
 		} else if (IS_ERR(na->ni)) {
-			antfs_log_error("ino %llx; na->ni is error %d!\n",
+			/* This must not happen though. */
+			antfs_log_error("ino 0x%llx; na->ni is error %d!\n",
 					(long long)ni->mft_no,
 					(int)PTR_ERR(na->ni));
 			na = NULL;
@@ -7165,10 +7112,8 @@ s64 ntfs_attr_get_free_bits(struct ntfs_attr *na)
 	int dbits;
 	size_t size_left;
 	struct ntfs_volume *vol;
-#if ANTFS_LOGLEVEL >= ANTFS_LOGLEVEL_DBG
 	s64 last_nr_free;
 	size_t bufcnt_orig;
-#endif
 #ifdef ANTFS_BMP_DBG
 	bool in_one_block;
 	loff_t block_start = 0;
@@ -7244,8 +7189,6 @@ s64 ntfs_attr_get_free_bits(struct ntfs_attr *na)
 			u8 *buf;
 			struct buffer_head *bh = sb_bread(vol->dev->d_sb, sect);
 
-			antfs_log_debug("Read sect: %lld; len: %lld",
-					(long long)sect, (long long)bh->b_size);
 			if (IS_ERR_OR_NULL(bh)) {
 				antfs_log_error
 				    ("sb_bread failed for sect %lld; run %d, "
@@ -7255,14 +7198,14 @@ s64 ntfs_attr_get_free_bits(struct ntfs_attr *na)
 				nr_free = -EIO;
 				goto out;
 			}
+			antfs_log_debug("Read sect: %lld; len: %lld",
+					(long long)sect, (long long)bh->b_size);
 			bufcnt = bh->b_size;
 			if (bufcnt > size_left)
 				bufcnt = size_left;
 
-#if ANTFS_LOGLEVEL >= ANTFS_LOGLEVEL_DBG
 			last_nr_free = nr_free;
 			bufcnt_orig = bufcnt;
-#endif
 			size_left -= bufcnt;
 
 			for (buf = bh->b_data; bufcnt; bufcnt--, buf++) {

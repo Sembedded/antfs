@@ -178,6 +178,7 @@ struct ntfs_volume {
 	u8 cluster_size_bits;	/* Log(2) of the byte size of a cluster. */
 	u8 mft_record_size_bits;/* Log(2) of the byte size of a mft record. */
 	u8 indx_record_size_bits;/* Log(2) of the byte size of a INDX record. */
+	u64 serial_no;		/* Volume serial number from boot sector */
 
 	/* Variables used by the cluster and mft allocators. */
 	u8 mft_zone_multiplier;	/* Initial mft zone multiplier. */

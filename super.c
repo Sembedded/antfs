@@ -38,12 +38,17 @@
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
 #include <linux/sched/task.h>
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#include <uapi/linux/mount.h>
+#endif
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("AVM GmbH");
 MODULE_DESCRIPTION("NTFS Filesystem");
 
 struct kmem_cache *antfs_inode_cachep;
+
+struct _logger_priv *global_logger;
 
 enum {
 	antfs_opt_utf8,
@@ -71,9 +76,6 @@ static const match_table_t tokens = {
  */
 void antfs_sbi_destroy(struct antfs_sb_info *sbi)
 {
-#ifdef CONFIG_AVM_ENHANCED
-	avm_logger_close(sbi->logger);
-#endif
 	kfree(sbi->dev);
 	kfree(sbi);
 }
@@ -348,8 +350,8 @@ static int antfs_fill_super(struct super_block *sb, void *data, int silent)
 	struct antfs_sb_info *sbi;
 	int err = 0;
 #ifdef CONFIG_AVM_ENHANCED
-	char *loggername;
-#endif		
+	char *loggername = "antfs_logger";
+#endif
 
 	sbi = kzalloc(sizeof(struct antfs_sb_info), GFP_KERNEL);
 	if (!sbi) {
@@ -360,19 +362,16 @@ static int antfs_fill_super(struct super_block *sb, void *data, int silent)
 	antfs_sbi_init(sb, sbi);
 
 #ifdef CONFIG_AVM_ENHANCED
-	loggername = kmalloc(sizeof(char) * 16, GFP_KERNEL);
-	if (!loggername) {
-		err = -ENOMEM;
-		goto err;
-	}
-
-	sprintf(loggername, "antfs_%s", sb->s_id);
 	/* set up the avm_logger to submit critical errors that corrupt the
-	 * ntfs device */
-	sbi->logger = avm_logger_create(PAGE_SIZE, loggername,
+	 * ntfs device
+	 */
+	if (!global_logger) {
+		global_logger = avm_logger_create(PAGE_SIZE, loggername,
 					logger_log_sd_dir);
-	kfree(loggername);
-	loggername = NULL;
+	/* if we fails to create a logger, set it null so we still get printk */
+		if (IS_ERR(global_logger))
+			global_logger = NULL;
+	}
 #endif
 
 	antfs_mnt_opts_init(sb, silent);
@@ -560,6 +559,9 @@ static int __init antfs_init(void)
 
 	err = antfs_fs_init();
 
+#ifdef CONFIG_AVM_ENHANCED
+	global_logger = NULL;
+#endif
 	return err;
 }
 
@@ -574,6 +576,10 @@ static void __exit antfs_exit(void)
 	pr_info("ANTFS Module unloaded.\n");
 
 	antfs_fs_cleanup();
+
+#ifdef CONFIG_AVM_ENHANCED
+	avm_logger_close(global_logger);
+#endif
 }
 
 module_init(antfs_init);

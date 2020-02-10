@@ -32,6 +32,11 @@
 #include <linux/aio.h>
 #include <linux/falloc.h>
 #include <linux/mpage.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0)
+#include <linux/uio.h>
+#else
+#include <linux/socket.h> //memcpy_fromiovec
+#endif
 
 #include "dir.h"
 #include "lcnalloc.h"
@@ -1026,9 +1031,17 @@ static int antfs_write_begin(struct file *filp, struct address_space *mapping,
 			     void **fsdata)
 #endif
 {
-	int err;
+	struct inode *inode = file_inode(filp);
+	struct ntfs_inode *ni = ANTFS_NI(inode);
+	int err = 0;
 
 	antfs_log_enter("inode %ld", file_inode(filp)->i_ino);
+
+	if (NInoTestAndSetWritePending(ni)) {
+		err = -EAGAIN;
+		goto out;
+	}
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 36)
 	err = block_write_begin(mapping, pos, len, flags, pagep,
 				antfs_get_block);
@@ -1041,8 +1054,10 @@ static int antfs_write_begin(struct file *filp, struct address_space *mapping,
 		if (err != -ENOSPC)
 			antfs_log_error("Write_begin failed: %d", err);
 		antfs_write_failed(mapping, pos + len);
+		NInoClearWritePending(ni);
 	}
 
+out:
 	antfs_log_leave("err: %d", err);
 	return err;
 }
@@ -1103,7 +1118,7 @@ static int antfs_write_end(struct file *filp, struct address_space *mapping,
 	if (err < 0 || (unsigned int)err < len) {
 		antfs_write_failed(mapping, pos + len);
 		antfs_log_error("Write end failed!");
-		return err;
+		goto out_unlocked;
 	}
 
 	/* Test if we have BUFFER_ZERONEW flags here. This is a strong hint that
@@ -1111,7 +1126,7 @@ static int antfs_write_end(struct file *filp, struct address_space *mapping,
 	 */
 	if (mutex_lock_interruptible_nested(&ni->ni_lock, NI_MUTEX_NORMAL)) {
 		err = -ERESTARTSYS;
-		return err;
+		goto out_unlocked;
 	}
 
 	bh = head;
@@ -1184,13 +1199,16 @@ static int antfs_write_end(struct file *filp, struct address_space *mapping,
 					(long long)ni->mft_no);
 		}
 	}
+
 	mutex_unlock(&ni->ni_lock);
+out_unlocked:
+	NInoClearWritePending(ni);
 	/* Done! */
 	return err;
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0)
-static ssize_t antfs_aio_write(struct kiocb *iocb, const struct iovec *iov,
+static ssize_t antfs_aio_write(struct kiocb *iocb, const struct iovec *_iov,
 			       unsigned long nr_segs, loff_t pos)
 #else
 static ssize_t antfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
@@ -1199,6 +1217,9 @@ static ssize_t antfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct ntfs_inode *ni = ANTFS_NI(inode);
 	struct ntfs_attr *na = ANTFS_NA(ni);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0)
+	struct iovec *iov = (struct iovec *)_iov;
+#endif
 	int err = 0;
 #ifdef ANTFS_EARLY_BLALLOC
 	struct ntfs_volume *vol = ni->vol;
@@ -1225,34 +1246,109 @@ static ssize_t antfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		goto out;
 	}
 
-	/* TODO: Add write support for compressed and resident files */
+	/* TODO: Add write support for compressed files */
 	if (unlikely(!NAttrNonResident(na))) {
-		struct ntfs_attr_search_ctx *ctx = NULL;
+		struct file *file = iocb->ki_filp;
+		struct ntfs_attr_search_ctx *ctx;
+		size_t count;
+		s64 rpos = (s64) iocb->ki_pos;
+		char *val;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0)
+		generic_segment_checks(iov, &nr_segs, &count, VERIFY_READ);
+		if (file->f_flags & O_APPEND) {
+#else
+		count = iov_iter_count(from);
+		if (iocb->ki_flags & IOCB_APPEND) {
+#endif
+		/* case appending: we wanna start copying from the end of the
+		 * file -> rpos = file size
+		 */
+			rpos = (loff_t)na->data_size;
+		}
+
+		err = ntfs_attr_truncate(na, rpos + count);
+		if (err) {
+			antfs_log_error("Failed to extend data attribute!");
+			mutex_unlock(&ni->ni_lock);
+			goto out;
+		}
+		if (NAttrNonResident(na)) {
+			/* Truncate already fixed the attribute and made it
+			 * nonresident. We only have to continue like we were a
+			 * nonresident attribute all along.
+			 */
+			goto unlock_mutex;
+		}
+
+		/* write content directly into the data attribute */
 		ctx = ntfs_attr_get_search_ctx(na->ni, NULL);
 		if (IS_ERR(ctx)) {
 			mutex_unlock(&ni->ni_lock);
-			return PTR_ERR(ctx);
-		}
-		err = ntfs_attr_lookup(na->type, na->name, na->name_len, 0, 0,
-				       NULL, 0, ctx);
-		if (err) {
-			ntfs_attr_put_search_ctx(ctx);
-			antfs_log_debug("ntfs_attr_lookup failed %d", err);
-			err = -ENOENT;
+			err = PTR_ERR(ctx);
 			goto out;
 		}
-		err = ntfs_attr_make_non_resident(na, ctx);
-		mutex_unlock(&ni->ni_lock);
+
+		err = ntfs_attr_lookup(na->type, na->name, na->name_len, 0,
+				       0, NULL, 0, ctx);
 		if (err) {
 			ntfs_attr_put_search_ctx(ctx);
-			antfs_log_debug
-			    ("<ERROR> could not make non resident! %d", err);
-			err = -ENOMEM;
+			mutex_unlock(&ni->ni_lock);
+			goto out;
+		}
+		val = (char *)ctx->attr + le16_to_cpu(ctx->attr->value_offset);
+		if (val < (char *)ctx->attr || val +
+		    le32_to_cpu(ctx->attr->value_length) >
+		    (char *)ctx->mrec + na->ni->vol->mft_record_size) {
+			err = -ERANGE;
+			/* log? sanity check failed! */
+			antfs_log_error("Data attribute outside of mft record");
+			mutex_unlock(&ni->ni_lock);
+			goto out;
+		}
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0)
+		err = memcpy_fromiovec(val + rpos, iov, count);
+		if (err < 0) {
+			antfs_log_error("Failed to copy data to buffer!");
+			if (file->f_flags & O_APPEND) {
+#else
+		err = copy_from_iter(val + rpos, count, from);
+		if (err != count) {
+			antfs_log_error("Failed to copy data to buffer!");
+			if (iocb->ki_flags & IOCB_APPEND) {
+#endif
+				/* shrink back to original size, this should not
+				 * fail if nothing really bad happens!
+				 */
+				err = ntfs_attr_truncate(na, inode->i_size);
+			} else {
+				/* file is filled with carbage now! vfs sets
+				 * file size to 0, so we should do the same!
+				 */
+				err = ntfs_attr_truncate(na, 0);
+			}
+			if (err)
+				antfs_log_critical("Corrupted file");
+			mutex_unlock(&ni->ni_lock);
+			err = -EFAULT;
 			goto out;
 		}
 		ntfs_attr_put_search_ctx(ctx);
+		mutex_unlock(&ni->ni_lock);
+
+		/* make sure no bullshit might be synced back with a possible
+		 * page that still contains old data
+		 */
+		truncate_inode_pages(file->f_mapping, 0);
+		i_size_write(inode, na->data_size);
+
+		/* we wrote count bytes */
+		err = count;
+		if (likely(count > 0))
+			iocb->ki_pos += count;
+		goto out;
 	} else {
+unlock_mutex:
 		mutex_unlock(&ni->ni_lock);
 	}
 #ifdef ANTFS_EARLY_BLALLOC
@@ -1313,33 +1409,6 @@ static ssize_t antfs_splice_write(struct pipe_inode_info *pipe,
 		goto out_locked;
 	}
 
-	/* TODO: Add write support for compressed and resident files */
-	if (unlikely(!NAttrNonResident(na))) {
-		struct ntfs_attr_search_ctx *ctx = NULL;
-
-		ctx = ntfs_attr_get_search_ctx(na->ni, NULL);
-		if (IS_ERR(ctx)) {
-			err = PTR_ERR(ctx);
-			goto out_locked;
-		}
-		err = ntfs_attr_lookup(na->type, na->name, na->name_len, 0, 0,
-				       NULL, 0, ctx);
-		if (err) {
-			ntfs_attr_put_search_ctx(ctx);
-			antfs_log_debug("ntfs_attr_lookup failed %d", err);
-			err = -ENOENT;
-			goto out_locked;
-		}
-		err = ntfs_attr_make_non_resident(na, ctx);
-		if (err) {
-			ntfs_attr_put_search_ctx(ctx);
-			antfs_log_debug
-			    ("<ERROR> could not make non resident! %d", err);
-			err = -ENOMEM;
-			goto out_locked;
-		}
-		ntfs_attr_put_search_ctx(ctx);
-	}
 #ifdef ANTFS_EARLY_BLALLOC
 	/* early alloc clusters: For transfers > 2 clusters, allocate stuff here
 	 * This should reduce fragmentation and speed things up a bit. */
@@ -1369,6 +1438,68 @@ out_locked:
 	goto out;
 }
 
+/**
+ * @brief (De)Allocate clusters in a file
+ *
+ * @param file      file to work on
+ * @param mode      one of the modes defined in fallocate.h
+ *                  Currently only a value of 0 and FALLOCATE_FL_KEEP_SIZE
+ *                  is supported which means allocate @length bytes at @offset.
+ *                  If FALLOCATE_FL_KEEP_SIZE is set, dont update data_size
+ *                  and inode->i_size.
+ * @param offset    Offset where we have to (de)allocate clusters.
+ *                  Currently only offset 0 is supported.
+ * @param length    Length of the area in bytes
+ *
+ * Currently this only supports allocating new clusters for files shorter than
+ * @offset + @length and with an @offset of 0.
+ *
+ * @return 0 on success or negative error code
+ */
+static long antfs_file_fallocate(struct file *file, int mode, loff_t offset,
+				 loff_t length)
+{
+	struct inode *inode = file_inode(file);
+	struct ntfs_inode *ni = ANTFS_NI(inode);
+	struct ntfs_attr *na = ANTFS_NA(ni);
+	s64 old_data_size = na->data_size;
+	int err = 0;
+
+	antfs_log_enter("ino %llu mode %x offset %llu len %llu", ni->mft_no,
+			mode, offset, length);
+
+
+	if (mode & ~FALLOC_FL_KEEP_SIZE ||
+	    offset > 0 ||
+	    offset + length < na->allocated_size ||
+	    offset + length < na->data_size ||
+	    !S_ISREG(inode->i_mode)) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+
+	if (mutex_lock_interruptible_nested(&ni->ni_lock, NI_MUTEX_NORMAL)) {
+		err = -ERESTARTSYS;
+		goto out;
+	}
+
+	err = ntfs_attr_truncate_i(na, offset + length, HOLES_NO);
+	mutex_unlock(&ni->ni_lock);
+
+	if (err)
+		goto out;
+
+	if (mode & FALLOC_FL_KEEP_SIZE)
+		na->data_size = old_data_size;
+
+	i_size_write(inode, na->data_size);
+	mark_inode_dirty(inode);
+
+out:
+	antfs_log_leave("err: %d", err);
+	return err;
+}
+
 static const struct file_operations antfs_file_operations = {
 	.llseek = generic_file_llseek,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 1, 0)
@@ -1388,7 +1519,7 @@ static const struct file_operations antfs_file_operations = {
 	.fsync = antfs_fsync,
 	.splice_read = generic_file_splice_read,
 	.splice_write = antfs_splice_write,
-/* ---  .fallocate      = antfs_file_fallocate, --- */
+	.fallocate = antfs_file_fallocate,
 };
 
 static const struct address_space_operations antfs_file_aops = {

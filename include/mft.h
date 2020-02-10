@@ -127,9 +127,6 @@ static inline u32 ntfs_mft_record_get_data_size(const struct MFT_RECORD *m)
 extern int ntfs_mft_record_layout(const struct ntfs_volume *vol,
 				  const MFT_REF mref, struct MFT_RECORD *mrec);
 
-extern int ntfs_mft_record_format(const struct ntfs_volume *vol,
-				  const MFT_REF mref);
-
 extern struct ntfs_inode *ntfs_mft_record_alloc(struct ntfs_volume *vol,
 						struct ntfs_inode *base_ni);
 

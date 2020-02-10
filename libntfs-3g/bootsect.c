@@ -50,7 +50,7 @@ bool ntfs_boot_sector_is_ntfs(struct NTFS_BOOT_SECTOR *b)
 
 	antfs_log_debug("Checking OEMid, NTFS signature.");
 	if (b->oem_id != const_cpu_to_le64(0x202020205346544eULL)) {/* "NTFS" */
-		antfs_log_error("NTFS signature is missing.");
+		antfs_log_debug("NTFS signature is missing.");
 		goto not_ntfs;
 	}
 
@@ -279,6 +279,7 @@ int ntfs_boot_sector_parse(struct ntfs_volume *vol,
 	antfs_log_debug("INDXRecordSize = 0x%x; INDXRecordSizeBits = %u",
 			(unsigned)vol->indx_record_size,
 			vol->indx_record_size_bits);
+	vol->serial_no = sle64_to_cpu(bs->volume_serial_number);
 	/*
 	 * Work out the size of the MFT mirror in number of mft records. If the
 	 * cluster size is less than or equal to the size taken by four mft

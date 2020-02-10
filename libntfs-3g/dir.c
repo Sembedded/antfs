@@ -38,6 +38,7 @@
 #include "misc.h"
 #include "reparse.h"
 #include "object_id.h"
+#include "security.h"
 
 /*
  * The little endian Unicode strings "$I30", "$SII", "$SDH", "$O"
@@ -114,7 +115,7 @@ int ntfs_inode_lookup_by_name(struct ntfs_inode *dir_ni,
 	struct ntfs_attr *ia_na;
 	int err, rc;
 	u32 index_block_size;
-	u8 index_vcn_size_bits;
+	u8 index_block_size_bits, index_vcn_size_bits;
 
 	antfs_log_enter();
 
@@ -144,12 +145,14 @@ int ntfs_inode_lookup_by_name(struct ntfs_inode *dir_ni,
 	ir = (struct INDEX_ROOT *) ((u8 *) ctx->attr +
 			     le16_to_cpu(ctx->attr->value_offset));
 	index_block_size = le32_to_cpu(ir->index_block_size);
+	/* This ensures index_block_size is a power of 2. */
 	if (index_block_size < NTFS_BLOCK_SIZE ||
 	    index_block_size & (index_block_size - 1)) {
 		antfs_log_error("Index block size %u is invalid.",
 				(unsigned)index_block_size);
 		goto put_err_out;
 	}
+	index_block_size_bits = __ffs(index_block_size);
 	index_end = (u8 *) &ir->index + le32_to_cpu(ir->index.index_length);
 	/* The first index entry. */
 	ie = (struct INDEX_ENTRY *) ((u8 *) &ir->index +
@@ -262,7 +265,7 @@ descend_into_child_node:
 
 	/* Read the index block starting at vcn. */
 	br = ntfs_attr_mst_pread(ia_na, vcn << index_vcn_size_bits, 1,
-				 index_block_size, ia, true);
+				 index_block_size_bits, ia, true);
 	if (br != 1) {
 		if (br >= 0)
 			err = -EIO;
@@ -963,7 +966,7 @@ int ntfs_readdir(struct ntfs_inode *dir_ni, s64 *pos,
 				(unsigned)index_block_size);
 		goto dir_err_out;
 	}
-	index_block_size_bits = ffs(index_block_size) - 1;
+	index_block_size_bits = __ffs(index_block_size);
 	if (vol->cluster_size <= index_block_size)
 		index_vcn_size_bits = vol->cluster_size_bits;
 	else
@@ -1098,7 +1101,7 @@ find_next_index_buffer:
 
 	/* Read the index block starting at bmp_pos. */
 	br = ntfs_attr_mst_pread(ia_na, bmp_pos << index_block_size_bits, 1,
-				 index_block_size, ia, true);
+				 index_block_size_bits, ia, true);
 	if (br != 1) {
 		err = (br < 0) ? (int)br : -EIO;
 		antfs_log_error("Failed to read index block");
@@ -1240,10 +1243,10 @@ static struct ntfs_inode *__ntfs_create(struct ntfs_inode *dir_ni, le32 securid,
 					const ntfschar *target, int target_len)
 {
 	struct ntfs_inode *ni;
-	int rollback_data = 0;
+	struct inode *inode;
 	struct FILE_NAME_ATTR *fn = NULL;
 	struct STANDARD_INFORMATION *si = NULL;
-	int err, tmp_err, fn_len, si_len;
+	int err, fn_len, si_len;
 
 	antfs_log_enter();
 
@@ -1314,6 +1317,12 @@ static struct ntfs_inode *__ntfs_create(struct ntfs_inode *dir_ni, le32 securid,
 		antfs_log_error("Failed to add STANDARD_INFORMATION "
 				"attribute.");
 		goto err_out;
+	}
+
+	if (!securid) {
+		err = ntfs_sd_add_everyone(ni);
+		if (err != 0)
+			goto err_out;
 	}
 
 	if (S_ISDIR(type)) {
@@ -1393,7 +1402,6 @@ static struct ntfs_inode *__ntfs_create(struct ntfs_inode *dir_ni, le32 securid,
 			ntfs_free(data);
 			goto err_out;
 		}
-		rollback_data = 1;
 		ntfs_free(data);
 	}
 	/* Create FILE_NAME attribute. */
@@ -1449,27 +1457,16 @@ static struct ntfs_inode *__ntfs_create(struct ntfs_inode *dir_ni, le32 securid,
 	return ni;
 
 err_out:
-	if (rollback_data)
-		ntfs_attr_remove(ni, AT_DATA, AT_UNNAMED, 0);
-
-	/* We never have extents in this stage. */
-	tmp_err = ntfs_mft_record_free(ni);
-	if (tmp_err != 0)
-		antfs_logger(((struct antfs_sb_info *)
-				ANTFS_I(ni)->i_sb->s_fs_info)->logger,
-				"Failed to free MFT record. Leaving "
-				"inconsistent metadata. Run chkdsk: %d",
-				tmp_err);
-	{
-		struct inode *inode = ANTFS_I(ni);
-		/* ntfs_mft_record_free does not free ni/VFS inode. Need to do
-		 * this NOW.
-		 *
-		 * ... set I_NEW to shut up iget_failed.
-		 */
-		inode->i_state |= I_NEW;
-		iget_failed(inode);
-	}
+	inode = ANTFS_I(ni);
+	/* Need to remove mft record and inode. Use evict inode
+	 * callback to do the job properly.
+	 * Make sure the mrec is removed if possible: clear nlink.
+	 *
+	 * ... set I_NEW to shut up iget_failed.
+	 */
+	clear_nlink(inode);
+	inode->i_state |= I_NEW;
+	iget_failed(inode);
 	ntfs_free(fn);
 	ntfs_free(si);
 	antfs_log_error("%d", err);
@@ -1762,17 +1759,19 @@ int ntfs_inode_free(struct ntfs_inode *ni)
 		err = PTR_ERR(actx);
 		goto out;
 	}
-	/* Free all clusters from non resident attributes */
+	/* Free all clusters from non resident attributes. Since this walks the
+	 * mrec in RAM this is ok even if this inode collided.
+	 */
 	while (!(err = ntfs_attrs_walk(actx))) {
 		if (actx->attr->non_resident) {
 			struct runlist_element *rl;
 
 			rl = ntfs_mapping_pairs_decompress(ni->vol, actx->attr,
-							   NULL);
+					NULL);
 			if (IS_ERR(rl)) {
 				/* log? we don't know if we just did that */
 				antfs_log_error("Failed to decompress "
-				    "runlist. Leaving inconsistent metadata.");
+						"runlist. Leaving inconsistent metadata.");
 				continue;
 			}
 			if (ntfs_cluster_free_from_rl(ni->vol, rl)) {
@@ -1794,13 +1793,10 @@ int ntfs_inode_free(struct ntfs_inode *ni)
 		clear_nlink(ANTFS_I(ni->extent_nis[i]));
 skip_free:
 	err = ntfs_mft_record_free(ni);
-	if (err != 0) {
-		antfs_logger(((struct antfs_sb_info *)
-			    ANTFS_I(ni)->i_sb->s_fs_info)->logger,
-			    "Failed to free base MFT record. Leaving "
-			    "inconsistent metadata");
-	}
-	ni = NULL;
+	if (err)
+		antfs_logger(ANTFS_I(ni)->i_sb->s_id,
+				"Failed to free base MFT record. Leaving "
+				"inconsistent metadata. err=%d", err);
 out:
 	if (!IS_ERR_OR_NULL(actx))
 		ntfs_attr_put_search_ctx(actx);
@@ -1916,8 +1912,7 @@ static int ntfs_link_i(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 	return 0;
 
 rollback_failed:
-	antfs_logger(((struct antfs_sb_info *)
-		    ANTFS_I(ni)->i_sb->s_fs_info)->logger,
+	antfs_logger(ANTFS_I(ni)->i_sb->s_id,
 		    "Rollback failed. Leaving inconsistent metadata.");
 err_out:
 	ntfs_free(fn);

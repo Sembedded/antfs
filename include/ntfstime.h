@@ -38,6 +38,12 @@
 
 #define NTFS_TIME_OFFSET ((s64)(369 * 365 + 89) * 24 * 3600 * 10000000)
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0)
+#define TIMESPEC timespec64
+#else
+#define TIMESPEC timespec
+#endif
+
 /**
  * ntfs2timespec - Convert an NTFS time to Unix time
  * @ntfs_time:  An NTFS time in 100ns units since 1601
@@ -47,9 +53,9 @@
  *
  * Return:  A Unix time (number of seconds since 1970, and nanoseconds)
  */
-static inline struct timespec ntfs2timespec(sle64 ntfstime)
+static inline struct TIMESPEC ntfs2timespec(sle64 ntfstime)
 {
-	struct timespec spec;
+	struct TIMESPEC spec;
 	uint64_t cputime;
 
 	cputime = sle64_to_cpu(ntfstime) - NTFS_TIME_OFFSET;
@@ -79,7 +85,7 @@ static inline struct timespec ntfs2timespec(sle64 ntfstime)
  *
  * Return:  An NTFS time (100ns units since Jan 1601)
  */
-static inline sle64 timespec2ntfs(struct timespec spec)
+static inline sle64 timespec2ntfs(struct TIMESPEC spec)
 {
 	s64 units;
 
@@ -94,10 +100,13 @@ static inline sle64 timespec2ntfs(struct timespec spec)
 
 static inline sle64 ntfs_current_time(void)
 {
-	struct timespec ts;
+	struct TIMESPEC ts;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0)
+	ktime_get_real_ts64(&ts);
+#else
 	getnstimeofday(&ts);
-
+#endif
 	return timespec2ntfs(ts);
 }
 
