@@ -625,6 +625,10 @@ static int antfs_readpages(struct file *file, struct address_space *mapping,
 		unsigned page_idx = nr_pages;
 		pgoff_t page_idx_to_init;
 		bool do_init_page = false;
+		
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+		DEFINE_READAHEAD(rac, file, mapping, 0);
+#endif
 
 		if (page_offs & (buffer_len - 1)) {
 			/* If initialized size is not on buffer boundary, walk
@@ -660,8 +664,15 @@ static int antfs_readpages(struct file *file, struct address_space *mapping,
 			}
 		}
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+		mpage_readahead(&rac, antfs_get_block);
+		err = 0;
+#else
+
 		err = mpage_readpages(mapping, pages, nr_pages,
 				antfs_get_block);
+ #endif 
+
 		if (!err && do_init_page) {
 			/* Initialize stuff past initialized_size with zero. */
 			page = grab_cache_page(mapping, page_idx_to_init);
