@@ -37,8 +37,11 @@ void *ntfs_malloc(size_t size)
 		/* kmalloc() has per-CPU caches so is faster for now. */
 		return kmalloc(size, GFP_KERNEL);
 	}
-
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+	return __vmalloc(size, GFP_KERNEL);
+#else
 	return __vmalloc(size, GFP_KERNEL, PAGE_KERNEL);
+#endif 
 }
 
 /**
