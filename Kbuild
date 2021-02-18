@@ -4,7 +4,10 @@
 
 LIBNTFS_SRC := libntfs-3g
 
-GIT_CMD = git -C $(src)
+# Iff $(src) is a relative path, prefix it with $(srctree)
+antfs_src = $(addprefix $(if $(filter-out /%,$(src)),$(srctree)/),$(src))
+
+GIT_CMD = git -C $(antfs_src)
 __avm_non_stable := $(shell $(GIT_CMD) rev-parse --abbrev-ref HEAD 2>/dev/null | grep -E '^(shared|p)/' || true)
 __avm_antfs_tag = $(shell $(GIT_CMD) describe --tags | grep -o '^[0-9.]*')
 __avm_antfs_commit = $(shell $(GIT_CMD) rev-parse --short HEAD)
@@ -43,5 +46,6 @@ antfs-y += $(LIBNTFS_SRC)/mst.o
 antfs-y += $(LIBNTFS_SRC)/object_id.o
 antfs-y += $(LIBNTFS_SRC)/reparse.o
 antfs-y += $(LIBNTFS_SRC)/runlist.o
+antfs-y += $(LIBNTFS_SRC)/security.o
 antfs-y += $(LIBNTFS_SRC)/unistr.o
 antfs-y += $(LIBNTFS_SRC)/volume.o

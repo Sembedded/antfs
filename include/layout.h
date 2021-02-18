@@ -1806,11 +1806,11 @@ struct GENERIC_MAPPING {
  */
 
 /**
- * struct ACCESS_DENIED_ACE -
+ * struct ACCESS_ALLOWED_ACE -
  *
  * ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, SYSTEM_AUDIT_ACE, SYSTEM_ALARM_ACE
  */
-struct ACCESS_DENIED_ACE {
+struct ACCESS_ALLOWED_ACE {
 	/*  0*/
 	enum ACE_TYPES type;    /* Type of the ACE. */
 	enum ACE_FLAGS flags;  /* Flags describing the ACE. */

@@ -37,12 +37,11 @@ void *ntfs_malloc(size_t size)
 		/* kmalloc() has per-CPU caches so is faster for now. */
 		return kmalloc(size, GFP_KERNEL);
 	}
-	if ((size >> PAGE_SHIFT) < totalram_pages)
-		return __vmalloc(size, GFP_KERNEL, PAGE_KERNEL);
-
-	antfs_log_error_ext("Failed to malloc %lld bytes",
-	       (long long)size);
-	return NULL;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+	return __vmalloc(size, GFP_KERNEL);
+#else
+	return __vmalloc(size, GFP_KERNEL, PAGE_KERNEL);
+#endif 
 }
 
 /**
@@ -77,6 +76,8 @@ void *ntfs_realloc(void *ptr, size_t size)
 
 void ntfs_free(void *addr)
 {
+	if (!addr)
+		return;
 	if (!is_vmalloc_addr(addr)) {
 		kfree(addr);
 		return;

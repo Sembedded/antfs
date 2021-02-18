@@ -32,10 +32,15 @@ struct runlist_element;
 #include "attrib.h"
 #include "volume.h"
 
-/** Default runlist buffer size. See @runlist_element below.
- *  This MUST be a power of two!
+/** Default runlist buffer chunk size. See @runlist_element below.
+ *  Allocate chunks of 16 runlist elements.
+ *  Note: Must be power of 2.
  */
-#define ANTFS_RL_BUF_SIZE 512
+#define ANTFS_RL_CHUNKS 16
+
+/** Default runlist buffer size. See @runlist_element below.
+ */
+#define ANTFS_RL_BUF_SIZE (sizeof(struct runlist_element) * ANTFS_RL_CHUNKS)
 
 /**
  * struct _runlist_element - in memory vcn to lcn mapping array element.
@@ -95,5 +100,7 @@ extern int ntfs_rl_truncate(struct runlist_element **arl, const VCN start_vcn);
 extern int ntfs_rl_sparse(struct runlist_element *rl);
 extern s64 ntfs_rl_get_compressed_size(struct ntfs_volume *vol,
 				       struct runlist_element *rl);
+extern struct runlist_element *ntfs_rl_realloc(struct runlist_element *rl,
+					       int old_count, int new_count);
 
 #endif /* defined _NTFS_RUNLIST_H */

@@ -79,6 +79,19 @@ static int antfs_root_path(struct dentry *entry, char *mnt_point,
 	return 0;
 }
 
+static inline void antfs_inode_update_times(struct inode *inode,
+					    enum ntfs_time_update_flags mask)
+{
+	if (mask & NTFS_UPDATE_ATIME)
+		inode->i_atime = current_time(inode);
+
+	if (mask & NTFS_UPDATE_MTIME)
+		inode->i_mtime = current_time(inode);
+
+	if (mask & NTFS_UPDATE_CTIME)
+		inode->i_ctime = current_time(inode);
+}
+
 /**
  *  @brief  antfs_lookup checks if an entry is kept inside a directory.
  *
@@ -256,6 +269,13 @@ static int antfs_create_i(struct inode *dir, struct dentry *entry, int mode)
 
 	antfs_log_enter("%s", entry->d_name.name);
 
+	if (dir_ni->vol->free_clusters - 1 <
+	    antfs_reserved_clusters(dir_ni->vol)) {
+		err = -ENOSPC;
+		goto out;
+	}
+
+
 	/* - check if the file already exists or no creation allowed - */
 	if (entry->d_inode) {
 		err = -EEXIST;
@@ -294,7 +314,10 @@ static int antfs_create_i(struct inode *dir, struct dentry *entry, int mode)
 
 	/* - write dir back to disk - */
 
-	err = antfs_inode_init(inode);
+	err = antfs_inode_init(&inode, ANTFS_INODE_INIT_DELETE);
+	/* inode_init does not discard collided inodes here so we can
+	 * unlink below.
+	 */
 	if (err) {
 		antfs_log_error("Could not fetch VFS inode!");
 		/* - we have to rewind the allocated ni - */
@@ -322,6 +345,7 @@ static int antfs_create_i(struct inode *dir, struct dentry *entry, int mode)
 		 * pass that to the vfs inode's i_size
 		 */
 		i_size_write(dir, ANTFS_NA(dir_ni)->data_size);
+		antfs_inode_update_times(dir, NTFS_UPDATE_MCTIME);
 		ntfs_inode_mark_dirty(ni);
 		ntfs_inode_mark_dirty(dir_ni);
 		mark_inode_dirty(inode);
@@ -495,6 +519,7 @@ static int antfs_unlink(struct inode *dir, struct dentry *entry)
 	 * pass that to the vfs inode's i_size
 	 */
 	i_size_write(dir, ANTFS_NA(dir_ni)->data_size);
+	antfs_inode_update_times(dir, NTFS_UPDATE_MCTIME);
 	ntfs_inode_mark_dirty(dir_ni);
 	mark_inode_dirty(dir);
 	if (unlikely(ni->mrec->link_count))
@@ -585,6 +610,7 @@ static int antfs_rmdir(struct inode *dir, struct dentry *entry)
 	 * pass that to the vfs inode's i_size
 	 */
 	i_size_write(dir, ANTFS_NA(dir_ni)->data_size);
+	antfs_inode_update_times(dir, NTFS_UPDATE_MCTIME);
 	ntfs_inode_mark_dirty(dir_ni);
 	mark_inode_dirty(dir);
 	if (unlikely(ni->mrec->link_count))
@@ -752,6 +778,9 @@ static int antfs_rename(struct inode *olddir, struct dentry *oldent,
 	 */
 	i_size_write(newdir, ANTFS_NA(dir_ni)->data_size);
 	i_size_write(olddir, ANTFS_NA(old_dir_ni)->data_size);
+	antfs_inode_update_times(olddir, NTFS_UPDATE_MCTIME);
+	antfs_inode_update_times(newdir, NTFS_UPDATE_MCTIME);
+	antfs_inode_update_times(oldent->d_inode, NTFS_UPDATE_CTIME);
 	ntfs_inode_mark_dirty(ni);
 	ntfs_inode_mark_dirty(dir_ni);
 	if (dir_ni != old_dir_ni)
@@ -1095,7 +1124,12 @@ static int antfs_setattr(struct dentry *entry, struct iattr *attr)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 1, 0)
 		inode_dio_wait(inode);
 #endif
-		if (inode->i_size == attr->ia_size) {
+		/* Always truncate if we try to set the size to 0
+		 * so we can free memory that was previously allocated
+		 * by fallocate
+		 */
+		if (inode->i_size == attr->ia_size &&
+		    !(ANTFS_NA(ni)->allocated_size > 0 && attr->ia_size == 0)) {
 			antfs_log_debug("no change needed!");
 			goto end_size;
 		}
@@ -1131,12 +1165,7 @@ static int antfs_setattr(struct dentry *entry, struct iattr *attr)
 			/* If this fails, better don't touch anything else. */
 			goto end_size;
 		}
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
-		inode->i_mtime = inode->i_ctime = CURRENT_TIME_SEC;
-#else
-		ktime_get_real_ts(&inode->i_mtime);
-		ktime_get_real_ts(&inode->i_ctime);
-#endif
+		antfs_inode_update_times(inode, NTFS_UPDATE_MCTIME);
 		if (inode_needs_sync(inode)) {
 			sync_mapping_buffers(inode->i_mapping);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37)

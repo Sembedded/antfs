@@ -90,13 +90,17 @@ static int __ntfs_volume_release(struct ntfs_volume *v)
 		ntfs_inode_sync(v->mft_ni);
 	ntfs_attr_close(v->mftbmp_na);
 	v->mftbmp_na = NULL;
-	v->mft_na = NULL;
-	ntfs_inode_close_free(&v->mft_ni);
 
 	if (!IS_ERR_OR_NULL(v->mftmirr_ni) && NInoDirty(v->mftmirr_ni))
 		ntfs_inode_sync(v->mftmirr_ni);
 	v->mftmirr_na = NULL;
 	ntfs_inode_close_free(&v->mftmirr_ni);
+
+	/*
+	 * close mft_ni last because other inodes might access vol->mft_na->rl
+	 */
+	ntfs_inode_close_free(&v->mft_ni);
+	v->mft_na = NULL;
 
 	if (v->dev) {
 		struct ntfs_device *dev = v->dev;
@@ -145,6 +149,7 @@ static int ntfs_mft_load(struct ntfs_volume *vol)
 {
 	VCN next_vcn, last_vcn, highest_vcn;
 	s64 l;
+	struct inode *inode;
 	struct MFT_RECORD *mb = NULL;
 	struct ntfs_attr_search_ctx *ctx = NULL;
 	struct ATTR_RECORD *a;
@@ -165,10 +170,13 @@ static int ntfs_mft_load(struct ntfs_volume *vol)
 	}
 	vol->mft_ni->mft_no = 0;
 	vol->mft_ni->mrec = mb;
-	err = antfs_inode_init(ANTFS_I(vol->mft_ni));
+	/* We don't actually "create" the MFT here, but if this inode_init
+	 * fails, we're in trouble.
+	 */
+	inode = ANTFS_I(vol->mft_ni);
+	err = antfs_inode_init(&inode, ANTFS_INODE_INIT_DISCARD);
 	if (err) {
 		antfs_log_error("Failed to initialize the MFT!");
-		iget_failed(ANTFS_I(vol->mft_ni));
 		vol->mft_ni = NULL;
 		goto error_exit;
 	}
@@ -752,16 +760,6 @@ out:
 	return err;
 }
 
-static int fix_txf_data_write(struct ntfs_attr *na, int64_t txf_data_size,
-			      void *txf_data)
-{
-	int res = 0;
-
-	res = ntfs_attr_pwrite(na, 0, txf_data_size, txf_data);
-	if (res == txf_data_size)
-		res = 0;
-	return res;
-}
 /*
  *		Make sure a LOGGED_UTILITY_STREAM attribute named "$TXF_DATA"
  *	on the root directory is resident.
@@ -802,13 +800,19 @@ static int fix_txf_data(struct ntfs_volume *vol)
 						AT_LOGGED_UTILITY_STREAM,
 						TXF_DATA, 9, &txf_data_size);
 				if (!IS_ERR(txf_data)) {
-					res = ntfs_attr_truncate(na, 0);
-					if (!res) {
-						res = fix_txf_data_write(na,
-						    txf_data_size, txf_data);
-					} else if (res > 0)
-						/* Make this an error. */
-						res = -ENOSPC;
+					res = ntfs_attr_remove(ni,
+						AT_LOGGED_UTILITY_STREAM,
+						TXF_DATA, 9);
+					/*
+					 * Don't write attribute if it's to big
+					 * to be resident
+					 */
+					if (!res && txf_data_size <=
+					    vol->mft_record_size)
+						res = ntfs_attr_add(ni,
+							AT_LOGGED_UTILITY_STREAM,
+							TXF_DATA, 9,
+							txf_data, txf_data_size);
 					ntfs_free(txf_data);
 				}
 				if (res)
@@ -818,7 +822,6 @@ static int fix_txf_data(struct ntfs_volume *vol)
 					antfs_log_error("$TXF_DATA made "
 							"resident");
 			}
-			ntfs_attr_close(na);
 		}
 		ntfs_inode_close(ni);
 	}
@@ -880,7 +883,7 @@ struct ntfs_volume *ntfs_device_mount(struct ntfs_device *dev,
 	}
 
 	l = ntfs_attr_mst_pread(vol->mft_na, 0, vol->mftmirr_size,
-			vol->mft_record_size, m, true);
+			vol->mft_record_size_bits, m, true);
 	if (l != vol->mftmirr_size) {
 		if (l < 0) {
 			antfs_log_error("Failed to read $MFT");
@@ -894,7 +897,7 @@ struct ntfs_volume *ntfs_device_mount(struct ntfs_device *dev,
 		goto error_exit;
 	}
 	l = ntfs_attr_mst_pread(vol->mftmirr_na, 0, vol->mftmirr_size,
-			vol->mft_record_size, m2, true);
+			vol->mft_record_size_bits, m2, true);
 	if (l != vol->mftmirr_size) {
 		if (l < 0) {
 			err = l;
@@ -1013,14 +1016,17 @@ struct ntfs_volume *ntfs_device_mount(struct ntfs_device *dev,
 	}
 	/* Read in the $DATA attribute value into the buffer. */
 	l = ntfs_attr_pread(na, 0, na->data_size, vol->upcase);
+	/* Done with the $UpCase mft record. */
+	ntfs_inode_close(ni);
 	if (l != na->data_size) {
 		antfs_log_error("Failed to read $UpCase, unexpected length "
 			       "(%lld != %lld).", (long long)l,
 			       (long long)na->data_size);
-		goto io_error_exit;
+		if (l >= 0)
+			goto io_error_exit;
+		err = l;
+		goto error_exit;
 	}
-	/* Done with the $UpCase mft record. */
-	ntfs_inode_close(ni);
 	/* Consistency check of $UpCase, restricted to plain ASCII chars */
 	k = 0x20;
 	while ((k < vol->upcase_len)
@@ -1168,14 +1174,17 @@ struct ntfs_volume *ntfs_device_mount(struct ntfs_device *dev,
 	}
 	/* Read in the $DATA attribute value into the buffer. */
 	l = ntfs_attr_pread(na, 0, na->data_size, vol->attrdef);
+	/* Done with the $AttrDef mft record. */
+	ntfs_inode_close(ni);
 	if (l != na->data_size) {
 		antfs_log_error("Failed to read $AttrDef, unexpected length "
 			       "(%lld != %lld).", (long long)l,
 			       (long long)na->data_size);
-		goto io_error_exit;
+		if (l >= 0)
+			goto io_error_exit;
+		err = l;
+		goto error_exit;
 	}
-	/* Done with the $AttrDef mft record. */
-	ntfs_inode_close(ni);
 	/*
 	 * Check for dirty logfile and hibernated Windows.
 	 * We care only about read-write mounts.

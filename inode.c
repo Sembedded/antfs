@@ -33,13 +33,16 @@
 #include <linux/sched.h>
 #include <linux/exportfs.h>
 #include <linux/delay.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#include <uapi/linux/mount.h>
+#endif
 
 #include "dir.h"
 #include "volume.h"
 #include "misc.h"
 
-#define NTFSAVM_DEFAULT_BLKSIZE 512
-#define NTFSAVM_SUPER_MAGIC 0x65735546
+/* "NTFS" in hex, interpreted by "stat -f" command */
+#define ANTFS_SUPER_MAGIC 0x5346544e
 
 struct antfs_mount_data {
 	int fd;
@@ -140,6 +143,7 @@ static void antfs_evict_inode(struct inode *inode)
 	struct ntfs_inode *ni = ANTFS_NI(inode);
 	int err, ext;
 	int want_delete = 0;
+	enum antfs_inode_mutex_lock_class lc = NI_MUTEX_NORMAL;
 
 	antfs_log_enter("ino: %ld", inode->i_ino);
 
@@ -172,6 +176,10 @@ static void antfs_evict_inode(struct inode *inode)
 		struct ntfs_inode *base_ni;
 		s32 i;
 
+		/* Use lower locking class for extents. Normal and parents may
+		 * already be locked here.
+		 */
+		lc = NI_MUTEX_EXTENT;
 		/*
 		 * If the inode is an extent inode, disconnect it from the
 		 * base inode before destroying it.
@@ -232,8 +240,7 @@ static void antfs_evict_inode(struct inode *inode)
 		/* We have no parent / dir_ni here (nlink is 0!)
 		 * --> free inode
 		 */
-		if (mutex_lock_interruptible_nested(&ni->ni_lock,
-					NI_MUTEX_NORMAL)) {
+		if (mutex_lock_interruptible_nested(&ni->ni_lock, lc)) {
 			antfs_log_error("Could not get ni_lock for ni %lld;",
 					(long long)ni->mft_no);
 			return;
@@ -332,7 +339,7 @@ static int antfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	}
 
 	antfs_log_enter();
-	buf->f_type = NTFSAVM_SUPER_MAGIC;
+	buf->f_type = ANTFS_SUPER_MAGIC;
 	/*
 	 * File system block size. Used to calculate used/free space by df.
 	 * Incorrectly documented as "optimal transfer block size".
@@ -351,7 +358,7 @@ static int antfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_blocks = vol->nr_clusters;
 
 	/* Free blocks available for all and for non-privileged processes. */
-	size = vol->free_clusters;
+	size = vol->free_clusters - antfs_reserved_clusters(vol);
 	if (size < 0)
 		size = 0;
 	buf->f_bavail = buf->f_bfree = size;
@@ -406,6 +413,8 @@ static int antfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 			(long long)buf->f_bavail, (long long)buf->f_files,
 			(long long)buf->f_ffree);
 
+	buf->f_fsid.val[0] = vol->serial_no & 0xffffffff;
+	buf->f_fsid.val[1] = (vol->serial_no >> 32) & 0xffffffff;
 	/* Maximum length of filenames. */
 	buf->f_namelen = NTFS_MAX_NAME_LEN;
 out:
@@ -413,15 +422,26 @@ out:
 }
 
 /**
- * @brief sets an inode's operations according to its mode
+ * antfs_inode_init: sets an inode's operations according to its mode
  *
- * @param inode	the vfs inode to initialize
+ * @inode    the vfs inode to initialize
+ * @create   Control the way inode collisions are handeled.
  *
  * antfs_inode_init sets the inode operations according to the type of
  * file the inode represents.
+ * If an inode collision in VFS is detected and create is 0, the inode supplied
+ * to this function is discarded and replaced with the colliding inode.
+ * If create is positive on inode collision, an error is reported and the inode
+ * is discarded but not replaced.
+ * If create is negative, the inode is discarded and deleted for extent inodes
+ * or NOT discarded at all for base inodes (caller is responsible for cleanup
+ * e.g. in @antfs_create_i).
+ *
+ * Return: 0 on success or negative error code.
  */
-int antfs_inode_init(struct inode *inode)
+int antfs_inode_init(struct inode **inode_in, enum antfs_inode_init_mode create)
 {
+	struct inode *inode = *inode_in;
 	struct ntfs_inode *ni = ANTFS_NI(inode);
 	int err = 0;
 
@@ -435,7 +455,7 @@ int antfs_inode_init(struct inode *inode)
 					inode->i_ino ==
 					(unsigned long)FILE_ROOT))) {
 		struct antfs_sb_info *sbi = ANTFS_SB(inode->i_sb);
-		struct timespec ts;
+		struct TIMESPEC ts;
 
 		/* Init a base mft record ("regular" inode):
 		 * this has to be done in context of either:
@@ -516,13 +536,31 @@ int antfs_inode_init(struct inode *inode)
 		 */
 	}
 
+	/* This fails if we already have an inode with the same
+	 * i_ino and i_sb that is not I_FREEING or I_WILL_FREE.
+	 */
 	if (insert_inode_locked(inode) < 0) {
-		/* This fails if we already have an inode with the same
-		 * i_ino and i_sb that is not I_FREEING or I_WILL_FREE. */
 		struct inode *c_inode = ilookup(inode->i_sb, inode->i_ino);
+		struct ntfs_inode *c_ni = c_inode ? ANTFS_NI(c_inode) : NULL;
 
-		avm_logger_printk_ratelimited(((struct antfs_sb_info *)
-			    inode->i_sb->s_fs_info)->logger,
+		/* Shut up unlock_new_inode in iget_failed. */
+		inode->i_state |= I_NEW;
+		NInoSetCollided(ni);
+		if (create == ANTFS_INODE_INIT_REPLACE &&
+				c_ni && c_ni->mft_no == ni->mft_no) {
+			antfs_log_info("Ino 0x%llx collided. Discard inode and "
+					"use valid counterpart instead.",
+					(long long)ni->mft_no);
+			*inode_in = c_inode;
+			iget_failed(inode);
+			/* Keep i_count at 1 for extents. */
+			if (c_ni->nr_extents < 0 && c_ni->base_ni &&
+					atomic_read(&c_inode->i_count) > 1)
+				iput(c_inode);
+			goto out;
+		}
+
+		antfs_logger(inode->i_sb->s_id,
 			    "[%s] insert_inode_locked failed.\n", __func__);
 
 		antfs_log_error_ext("insert_inode_locked failed. ino collision?"
@@ -561,20 +599,35 @@ int antfs_inode_init(struct inode *inode)
 					"mft: %lld;"
 					"our ni: %p;",
 					(long long)
-					ANTFS_NI(c_inode)->mft_no,
+					c_ni->mft_no,
 					orig_ni);
 
 			if (ANTFS_NI(c_inode)->base_ni)
 				antfs_log_error("c nr_extents: %d; "
 					"c base_ino: %lld",
-					(int)ANTFS_NI(c_inode)->nr_extents,
+					(int)c_ni->nr_extents,
 					(long long)
-					ANTFS_NI(c_inode)->base_ni->mft_no);
+					c_ni->base_ni->mft_no);
+
+			/* Trigger a rewrite of the original inode. */
+			ntfs_inode_mark_dirty(c_ni);
+			mark_inode_dirty(c_inode);
 			iput(c_inode);
 		}
-		/* Shut up unlock_new_inode in iget_failed. */
-		inode->i_state |= I_NEW;
 		err = -EEXIST;
+		if (create != ANTFS_INODE_INIT_REPLACE) {
+			if (create == ANTFS_INODE_INIT_DELETE) {
+				/* DELETE new extent inodes that failed to
+				 * insert. Don't delete base inodes though.
+				 * Caller is expected to do cleanup.
+				 */
+				if (ni->nr_extents < 0)
+					clear_nlink(inode);
+				else
+					goto out;
+			}
+			iget_failed(inode);
+		}
 		goto out;
 	}
 
@@ -704,10 +757,17 @@ static int antfs_write_inode(struct inode *inode,
 	antfs_log_enter();
 	if (is_bad_inode(inode))
 		goto out_unlocked;
+
+	if (NInoWritePending(ni)) {
+		err = -EAGAIN;
+		goto out_unlocked;
+	}
+
 	if (mutex_lock_interruptible_nested(&ni->ni_lock, NI_MUTEX_NORMAL)) {
 		err = -ERESTARTSYS;
 		goto out_unlocked;
 	}
+
 	if (!IS_ERR_OR_NULL(na)
 		&& NAttrNonResident(na)) {
 		err = ntfs_attr_truncate(na, inode->i_size);
@@ -732,8 +792,11 @@ static int antfs_write_inode(struct inode *inode,
 			cpu_to_sle64(na->initialized_size);
 		ctx->attr->data_size = cpu_to_sle64(inode->i_size);
 		ctx->attr->allocated_size = cpu_to_sle64(na->allocated_size);
+		if (na->data_flags & (ATTR_COMPRESSION_MASK | ATTR_IS_SPARSE))
+			ctx->attr->compressed_size = cpu_to_sle64(
+				na->compressed_size);
 
-		ntfs_inode_mark_dirty(ni);
+		ntfs_inode_mark_dirty(ctx->ntfs_ino);
 		ntfs_attr_put_search_ctx(ctx);
 	}
 

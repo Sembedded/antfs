@@ -76,29 +76,55 @@ static void ntfs_rl_mc(struct runlist_element *dstbase, int dst,
 /**
  * ntfs_rl_realloc - Reallocate memory for runlists
  * @rl:		original runlist
- * @old_size:	number of runlist elements in the original runlist @rl
- * @new_size:	number of runlist elements we need space for
+ * @old_count:	number of runlist elements in the original runlist @rl
+ * @new_count:	number of runlist elements we need space for
  *
  * As the runlists grow, more memory will be required. To prevent large
- * numbers of small reallocations of memory, this function returns a 4kiB block
- * of memory.
+ * numbers of small reallocations of memory, only reallocate in chunks of
+ * @ANTFS_RL_CHUNKS runlist elements.
  *
- * N.B.	If the new allocation doesn't require a different number of 4kiB
- *	blocks in memory, the function will return the original pointer.
+ * N.B.	If the new allocation doesn't require a different number of rl chunks
+ *	in memory, the function will return the original pointer.
+ *
+ * Note If reallocation fails and NULL is returned @rl is left untouched.
  *
  * On success, return a pointer to the newly allocated, or recycled, memory.
- * On error, return NULL with errno set to the error code.
+ * On error, return NULL.
  */
-static struct runlist_element *ntfs_rl_realloc(struct runlist_element *rl,
-					       int old_size, int new_size)
+struct runlist_element *ntfs_rl_realloc(struct runlist_element *rl,
+		int old_count, int new_count)
 {
-	old_size = (old_size * sizeof(struct runlist_element) +
-			ANTFS_RL_BUF_SIZE - 1) & ~(ANTFS_RL_BUF_SIZE - 1);
-	new_size = (new_size * sizeof(struct runlist_element) +
-			ANTFS_RL_BUF_SIZE - 1) & ~(ANTFS_RL_BUF_SIZE - 1);
-	if (old_size == new_size)
+	struct runlist_element *new_rl;
+	int old_size_round, new_size_round;
+
+	BUILD_BUG_ON_NOT_POWER_OF_2(ANTFS_RL_CHUNKS);
+	if (!new_count) {
+		ntfs_free(rl);
+		return NULL;
+	}
+	/* Round up to runlist chunks. */
+	old_size_round = ALIGN(old_count, ANTFS_RL_CHUNKS);
+	new_size_round = ALIGN(new_count, ANTFS_RL_CHUNKS);
+	old_size_round *= sizeof(struct runlist_element);
+	new_size_round *= sizeof(struct runlist_element);
+	if (old_size_round >= PAGE_SIZE && new_size_round >= PAGE_SIZE) {
+		old_size_round = PAGE_ALIGN(old_size_round);
+		new_size_round = PAGE_ALIGN(new_size_round);
+	}
+	if (old_size_round == new_size_round)
 		return rl;
-	return ntfs_realloc(rl, new_size);
+	new_rl = ntfs_malloc(new_size_round);
+	if (new_rl == NULL)
+		return new_rl;
+	if (old_count && rl != NULL) {
+		memcpy(new_rl, rl, min(old_count * sizeof(
+						struct runlist_element),
+					new_count * sizeof(
+						struct runlist_element)));
+		ntfs_free(rl);
+	}
+
+	return new_rl;
 }
 
 /*
@@ -799,8 +825,6 @@ static struct runlist_element
 				   runlist_elements. */
 	u8 b;			/* Current byte offset in buf. */
 
-	antfs_log_debug("Entering for attr 0x%x.",
-			(unsigned)le32_to_cpu(attr->type));
 	/* Make sure attr exists and is non-resident. */
 	if (!attr || !attr->non_resident ||
 			sle64_to_cpu(attr->lowest_vcn) < (VCN)0) {
@@ -811,6 +835,10 @@ static struct runlist_element
 					sle64_to_cpu(attr->lowest_vcn) : -1LL));
 		return ERR_PTR(-EINVAL);
 	}
+
+	antfs_log_debug("Entering for attr 0x%x.",
+			(unsigned)le32_to_cpu(attr->type));
+
 	/* Start at vcn = lowest_vcn and lcn 0. */
 	vcn = sle64_to_cpu(attr->lowest_vcn);
 	lcn = 0;
@@ -824,8 +852,8 @@ static struct runlist_element
 	/* Current position in runlist array. */
 	rlpos = 0;
 	/* Allocate first buffer and set current runlist size. */
-	rlsize = ANTFS_RL_BUF_SIZE;
-	rl = ntfs_malloc(rlsize);
+	rlsize = ANTFS_RL_CHUNKS;
+	rl = ntfs_rl_realloc(NULL, 0, ANTFS_RL_CHUNKS);
 	if (!rl)
 		return ERR_PTR(-ENOMEM);
 	/* Insert unmapped starting element if necessary. */
@@ -840,15 +868,16 @@ static struct runlist_element
 		 * Allocate more memory if needed, including space for the
 		 * not-mapped and terminator elements.
 		 */
-		if ((int)((rlpos + 3) * sizeof(*old_rl)) > rlsize) {
+		if ((int)(rlpos + 3) > rlsize) {
 			struct runlist_element *rl2;
 
-			rlsize += ANTFS_RL_BUF_SIZE;
-			rl2 = ntfs_realloc(rl, rlsize);
+			rl2 = ntfs_rl_realloc(rl, rlsize,
+					rlsize + ANTFS_RL_CHUNKS);
 			if (!rl2) {
 				ntfs_free(rl);
 				return ERR_PTR(-ENOMEM);
 			}
+			rlsize += ANTFS_RL_CHUNKS;
 			rl = rl2;
 		}
 		/* Enter the current vcn into the current runlist element. */
@@ -1639,8 +1668,8 @@ err_set:
  */
 int ntfs_rl_truncate(struct runlist_element **arl, const VCN start_vcn)
 {
-	struct runlist_element *rl;
-	/* bool is_end = FALSE; */
+	struct runlist_element *rl, *tmp_rl = NULL;
+	int old_size;
 
 	if (!arl || !*arl) {
 		if (!arl)
@@ -1659,16 +1688,17 @@ int ntfs_rl_truncate(struct runlist_element **arl, const VCN start_vcn)
 	}
 
 	/* Find the starting vcn in the run list. */
-	while (rl->length) {
-		if (start_vcn < rl[1].vcn)
-			break;
-		rl++;
+	for (old_size = 0; rl->length; old_size++, rl++) {
+		if (tmp_rl == NULL && start_vcn < rl[1].vcn)
+			tmp_rl = rl;
 	}
 
-	if (!rl->length) {
+	if (!tmp_rl) {
 		antfs_log_debug("Truncating already truncated runlist?");
 		return -EIO;
 	}
+	rl = tmp_rl;
+	old_size++;  /* Count in closing element. */
 
 	/* Truncate the run. */
 	rl->length = start_vcn - rl->vcn;
@@ -1680,27 +1710,13 @@ int ntfs_rl_truncate(struct runlist_element **arl, const VCN start_vcn)
 	 */
 	if (rl->length) {
 		++rl;
-		/*
-		   if (!rl->length)
-		   is_end = true;
-		   */
 		rl->vcn = start_vcn;
 		rl->length = 0;
 	}
 	rl->lcn = (LCN)LCN_ENOENT;
-	/**
-	 * Reallocate memory if necessary.
-	 * FIXME: Below code is broken, because runlist allocations must be
-	 * a multiple of 4096. The code caused crashes and corruptions.
-	 */
-	/*
-	    if (!is_end) {
-	    size_t new_size = (rl - *arl + 1) * sizeof(struct runlist_element);
-	    rl = ntfs_realloc(*arl, new_size);
-	    if (rl)
-	 *arl = rl;
-	 }
-	 */
+	rl = ntfs_rl_realloc(*arl, old_size, (rl - *arl + 1));
+	if (rl)
+		*arl = rl;
 	return 0;
 }
 

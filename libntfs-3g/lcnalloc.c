@@ -35,7 +35,7 @@
  * the update of the mapping pairs which converges to the cubic Faulhaber's
  * formula as the function of the number of extents (fragments, runs).
  */
-#define NTFS_LCNALLOC_BSIZE 127
+#define NTFS_LCNALLOC_BSIZE 31
 #define NTFS_LCNALLOC_SKIP  NTFS_LCNALLOC_BSIZE
 
 enum {
@@ -69,9 +69,29 @@ static void ntfs_cluster_set_zone_pos(LCN start, LCN end, LCN *pos, LCN tc)
 }
 
 static void ntfs_cluster_update_zone_pos(struct ntfs_volume *vol, u8 zone,
-					 LCN lcn)
+					 LCN lcn, s64 size)
 {
-	LCN tc = lcn + NTFS_LCNALLOC_SKIP;
+	LCN size_in_clusters = size >> vol->cluster_size_bits;
+	LCN tc = lcn;
+
+	if (size_in_clusters < 0) {
+		/* special case for mft record alloc, make space for another
+		 * allocation of records
+		 */
+		unsigned int nr;
+
+		nr = vol->mft_record_size << MFT_DATA_BURST_ALLOC_SHIFT >>
+			vol->cluster_size_bits;
+		tc += nr;
+	} else if (size_in_clusters < 8) {
+		tc += 1;
+	} else if (size_in_clusters < 32) {
+		tc += 31;
+	} else if (size_in_clusters < 2048) {
+		tc += 63;
+	} else {
+		tc += 255;
+	}
 
 	antfs_log_debug("tc = %lld, zone = %d", (long long)tc, zone);
 
@@ -95,7 +115,7 @@ static void ntfs_cluster_update_zone_pos(struct ntfs_volume *vol, u8 zone,
 static void antfs_force_zone_pos(struct ntfs_volume *vol, u8 zone,
 					 LCN lcn)
 {
-	antfs_log_enter("tc = %lld, zone = %d", (long long)tc, zone);
+	antfs_log_enter("lcn = %lld, zone = %d", (long long)lcn, zone);
 
 	if (zone == ZONE_MFT) {
 		ntfs_cluster_set_zone_pos(vol->mft_lcn, vol->mft_zone_end,
@@ -117,17 +137,22 @@ void update_full_status(struct ntfs_volume *vol, LCN lcn)
 {
 	if (lcn >= vol->mft_zone_end) {
 		if (vol->full_zones & ZONE_DATA1) {
-			ntfs_cluster_update_zone_pos(vol, ZONE_DATA1, lcn);
+			ntfs_cluster_set_zone_pos(vol->mft_zone_end,
+					    vol->nr_clusters,
+					    &vol->data1_zone_pos, lcn);
 			vol->full_zones &= ~ZONE_DATA1;
 		}
 	} else if (lcn < vol->mft_zone_start) {
 		if (vol->full_zones & ZONE_DATA2) {
-			ntfs_cluster_update_zone_pos(vol, ZONE_DATA2, lcn);
+			ntfs_cluster_set_zone_pos(0, vol->mft_zone_start,
+					    &vol->data2_zone_pos, lcn);
 			vol->full_zones &= ~ZONE_DATA2;
 		}
 	} else {
 		if (vol->full_zones & ZONE_MFT) {
-			ntfs_cluster_update_zone_pos(vol, ZONE_MFT, lcn);
+			ntfs_cluster_set_zone_pos(vol->mft_lcn,
+					    vol->mft_zone_end,
+					    &vol->mft_zone_pos, lcn);
 			vol->full_zones &= ~ZONE_MFT;
 		}
 	}
@@ -340,7 +365,7 @@ static LCN antfs_get_zone_pos(struct ntfs_volume *vol, LCN lcn, u8 zone)
  *
  * The complexity stems from the need of implementing the mft vs data zoned
  * approach and from the fact that we have access to the lcn bitmap via up to
- * NTFS_LCNALLOC_BSIZE bytes at a time, so we need to cope with crossing over
+ * @b_size (buffer_head) bytes at a time, so we need to cope with crossing over
  * boundaries of two buffers. Further, the fact that the allocator allows for
  * caller supplied hints as to the location of where allocation should begin
  * and the fact that the allocator keeps track of where in the data zones the
@@ -354,16 +379,17 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 					   VCN start_vcn, s64 count,
 					   LCN start_lcn,
 					   const enum
-					   NTFS_CLUSTER_ALLOCATION_ZONES zone)
+					   NTFS_CLUSTER_ALLOCATION_ZONES zone,
+					   s64 file_size)
 {
 	struct runlist_element *rl = NULL, *trl;
 	LCN zone_start, zone_end;	/* current search range */
 	LCN lcn;
 	LCN prev_lcn = 0, prev_run_len = 0;
-	s64 clusters;
+	s64 clusters, reserved_clusters;
 	int block_to_lcnbits;
 	LCN block_to_lcnbits_mask;
-	int rlpos, rlsize;
+	int rl_pos, rl_elements;
 	int err = 0;
 	int pass = 1;
 	u8 search_zone;	/* 4: data2 (start) 1: mft (middle) 2: data1 (end) */
@@ -396,6 +422,15 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 		goto out;
 	}
 
+	/* XXX: This is to prevent the volume from becoming completely filled
+	 *      up. Windows and chkdsk really don't like this.
+	 */
+	reserved_clusters = antfs_reserved_clusters(vol);
+	if (vol->free_clusters < reserved_clusters ||
+	    vol->free_clusters - reserved_clusters < count) {
+		err = -ENOSPC;
+		goto done_err_ret;
+	}
 	/* initialize constant variables */
 	block_to_lcnbits = 3 + vol->dev->d_sb->s_blocksize_bits;
 	block_to_lcnbits_mask = (vol->dev->d_sb->s_blocksize << 3) - 1;
@@ -411,6 +446,17 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 			zone_start = vol->data1_zone_pos;
 		else
 			zone_start = vol->mft_zone_pos;
+	}
+
+	/* Fix zone_start if it doesn't lay inside the zone we should use to
+	 * allocate the new cluster. Check if the preferred zone is full though!
+	 */
+	if (zone != MFT_ZONE && zone_start >= vol->mft_zone_start &&
+	    zone_start < vol->mft_zone_end) {
+		if (!(vol->full_zones & ZONE_DATA1))
+			zone_start = vol->data1_zone_pos;
+		else if (!(vol->full_zones & ZONE_DATA2))
+			zone_start = vol->data2_zone_pos;
 	}
 
 	/* there is no need for a second pass if we start at the beginning of
@@ -436,7 +482,7 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 
 	/* === Loop until all clusters are allocated. === */
 	clusters = count;
-	rlpos = rlsize = 0;
+	rl_pos = rl_elements = 0;
 
 	if (mutex_lock_interruptible(&vol->lcnbmp_lock)) {
 		err = -EBUSY;
@@ -523,15 +569,18 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 			/* Found a clear bit / free LCN here */
 
 			/* Reallocate memory if necessary. */
-			if ((rlpos + 2) * (int)sizeof(struct runlist_element) >=
-			    rlsize) {
-				rlsize += ANTFS_RL_BUF_SIZE;
-				trl = ntfs_realloc(rl, rlsize);
+			if (rl_pos + 2 >= rl_elements) {
+				int new_rl_elements = rl_elements +
+					ANTFS_RL_CHUNKS;
+
+				trl = ntfs_rl_realloc(rl, rl_elements,
+						new_rl_elements);
 				if (!trl) {
 					err = -ENOMEM;
 					goto err_ret;
 				}
 				rl = trl;
+				rl_elements = new_rl_elements;
 			}
 
 			/* Allocate the bitmap bit. */
@@ -551,40 +600,40 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 			antfs_log_debug
 			    ("prev_lcn(%lld) prev_run_len(%lld), lcn(%lld)",
 			     prev_lcn, prev_run_len, lcn);
-			if (prev_lcn == lcn - prev_run_len && rlpos) {
+			if (prev_lcn == lcn - prev_run_len && rl_pos) {
 				antfs_log_debug("Cluster coalesce: prev_lcn("
 						"%lld) lcn(%lld)"
 						"prev_run_len(%lld)",
 						(long long)prev_lcn,
 						(long long)lcn,
 						(long long)prev_run_len);
-				rl[rlpos - 1].length = ++prev_run_len;
+				rl[rl_pos - 1].length = ++prev_run_len;
 			} else {
-				if (rlpos)
-					rl[rlpos].vcn = rl[rlpos - 1].vcn +
+				if (rl_pos)
+					rl[rl_pos].vcn = rl[rl_pos - 1].vcn +
 					    prev_run_len;
 				else {
-					rl[rlpos].vcn = start_vcn;
+					rl[rl_pos].vcn = start_vcn;
 					antfs_log_debug("Start_vcn: %lld",
 							(long long)start_vcn);
 				}
 
-				rl[rlpos].lcn = prev_lcn = lcn;
-				rl[rlpos].length = prev_run_len = 1;
+				rl[rl_pos].lcn = prev_lcn = lcn;
+				rl[rl_pos].length = prev_run_len = 1;
 				antfs_log_debug("2) rl->lcn: %lld",
-						rl[rlpos].lcn);
-				rlpos++;
+						rl[rl_pos].lcn);
+				rl_pos++;
 			}
 
 			antfs_log_debug("RUN:   %-16lld %-16lld %-16lld",
-					(long long)rl[rlpos - 1].vcn,
-					(long long)rl[rlpos - 1].lcn,
-					(long long)rl[rlpos - 1].length);
+					(long long)rl[rl_pos - 1].vcn,
+					(long long)rl[rl_pos - 1].lcn,
+					(long long)rl[rl_pos - 1].length);
 
 			/* Done? */
 			if (!--clusters) {
 				ntfs_cluster_update_zone_pos(vol, search_zone,
-							     lcn);
+							     lcn, file_size);
 				goto done_ret;
 			}
 
@@ -647,6 +696,8 @@ zone_pass_skip:
 skip_zone:
 		done_zones |= search_zone;
 		if (done_zones < (ZONE_MFT + ZONE_DATA1 + ZONE_DATA2)) {
+			LCN tmp_lcn;
+
 			antfs_log_debug("Switching zone.");
 			pass = 1;
 
@@ -675,6 +726,32 @@ switch_to_data1_zone:		search_zone = ZONE_DATA1;
 					antfs_log_debug("data2 -> data1");
 					goto switch_to_data1_zone;
 				}
+				/* We don't just go to MFT: We shrink MFT
+				 * zone instead and try again with DATA1.
+				 *
+				 * Shrink MFT zone by half of free space.
+				 */
+				tmp_lcn = (vol->mft_zone_end -
+					   vol->mft_zone_start -
+					   (vol->mft_na->allocated_size >>
+					    vol->cluster_size_bits)) >> 1;
+				/* DEBUG */
+				antfs_log_debug("shrinking MFT: old_end="
+						"0x%llx; new_end=0x%llx",
+						(long long)vol->mft_zone_end,
+						(long long)(vol->mft_zone_end
+							    - tmp_lcn));
+				if (tmp_lcn) {
+					vol->mft_zone_end -= tmp_lcn;
+					done_zones &= ~ZONE_DATA1;
+					update_full_status(vol,
+							   vol->mft_zone_end);
+					goto switch_to_data1_zone;
+				}
+				/* Shrinking the MFT any further at this point
+				 * get's rediculous. MFT is probably full, but
+				 * give it a try anyway.
+				 */
 				antfs_log_debug("Zone switch: data2 -> mft");
 				search_zone = ZONE_MFT;
 				zone_start = vol->mft_zone_pos;
@@ -722,9 +799,9 @@ switch_to_data1_zone:		search_zone = ZONE_DATA1;
 done_ret:
 	antfs_log_debug("At done_ret.");
 	/* Add runlist terminator element. */
-	rl[rlpos].vcn = rl[rlpos - 1].vcn + rl[rlpos - 1].length;
-	rl[rlpos].lcn = LCN_RL_NOT_MAPPED;
-	rl[rlpos].length = 0;
+	rl[rl_pos].vcn = rl[rl_pos - 1].vcn + rl[rl_pos - 1].length;
+	rl[rl_pos].lcn = LCN_RL_NOT_MAPPED;
+	rl[rl_pos].length = 0;
 	mutex_unlock(&vol->lcnbmp_lock);
 done_err_ret:
 	if (err) {
@@ -745,9 +822,9 @@ err_ret:
 	mutex_unlock(&vol->lcnbmp_lock);
 	if (rl) {
 		/* Add runlist terminator element. */
-		rl[rlpos].vcn = rl[rlpos - 1].vcn + rl[rlpos - 1].length;
-		rl[rlpos].lcn = LCN_RL_NOT_MAPPED;
-		rl[rlpos].length = 0;
+		rl[rl_pos].vcn = rl[rl_pos - 1].vcn + rl[rl_pos - 1].length;
+		rl[rl_pos].lcn = LCN_RL_NOT_MAPPED;
+		rl[rl_pos].length = 0;
 		ntfs_debug_runlist_dump(rl);
 		ntfs_cluster_free_from_rl(vol, rl);
 		ntfs_free(rl);
@@ -795,8 +872,7 @@ int ntfs_cluster_free_from_rl(struct ntfs_volume *vol,
 out:
 	vol->free_clusters += nr_freed;
 	if (vol->free_clusters > vol->nr_clusters) {
-		antfs_logger(((struct antfs_sb_info *)
-				vol->dev->d_sb->s_fs_info)->logger,
+		antfs_logger(vol->dev->d_sb->s_id,
 				"Too many free clusters (%lld > %lld)!",
 				(long long)vol->free_clusters,
 				(long long)vol->nr_clusters);
@@ -889,8 +965,7 @@ out:
 		mark_buffer_dirty(vol->lcnbmp_bh);
 
 	if (vol->free_clusters > vol->nr_clusters) {
-		antfs_logger(((struct antfs_sb_info *)
-				vol->dev->d_sb->s_fs_info)->logger,
+		antfs_logger(vol->dev->d_sb->s_id,
 				"Too many free clusters (%lld > %lld)!",
 				(long long)vol->free_clusters,
 				(long long)vol->nr_clusters);
@@ -909,8 +984,7 @@ rewind:
 			err = PTR_ERR(vol->lcnbmp_bh);
 			if (err == 0)
 				err = -EIO;
-			antfs_logger(((struct antfs_sb_info *)
-				vol->dev->d_sb->s_fs_info)->logger,
+			antfs_logger(vol->dev->d_sb->s_id,
 				"Rewind: Reading LCN bitmap failed: %d", err);
 			vol->lcnbmp_bh = NULL;
 			goto out_locked;
@@ -944,8 +1018,7 @@ rewind:
 				err = PTR_ERR(vol->lcnbmp_bh);
 				if (err == 0)
 					err = -EIO;
-				antfs_logger( ((struct antfs_sb_info *)
-					 vol->dev->d_sb->s_fs_info)->logger,
+				antfs_logger(vol->dev->d_sb->s_id,
 					"Failed to read the bitmap while "
 					"rewinding! %d", err);
 				vol->lcnbmp_bh = NULL;
@@ -986,8 +1059,7 @@ int ntfs_cluster_free_basic(struct ntfs_volume *vol, s64 lcn, s64 count)
 out:
 	vol->free_clusters += nr_freed;
 	if (vol->free_clusters > vol->nr_clusters) {
-		antfs_logger(((struct antfs_sb_info *)
-				vol->dev->d_sb->s_fs_info)->logger,
+		antfs_logger(vol->dev->d_sb->s_id,
 				"Too many free clusters (%lld > %lld)!",
 				(long long) vol->free_clusters,
 				(long long) vol->nr_clusters);
@@ -1111,8 +1183,7 @@ int ntfs_cluster_free(struct ntfs_volume *vol, struct ntfs_attr *na,
 out:
 	vol->free_clusters += nr_freed;
 	if (vol->free_clusters > vol->nr_clusters) {
-		antfs_logger(((struct antfs_sb_info *)
-			vol->dev->d_sb->s_fs_info)->logger,
+		antfs_logger(vol->dev->d_sb->s_id,
 			"Too many free clusters (%lld > %lld)!",
 			(long long)vol->free_clusters,
 			(long long)vol->nr_clusters);

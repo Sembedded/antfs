@@ -290,10 +290,10 @@ void *ntfs_attr_readall(struct ntfs_inode *ni, const enum ATTR_TYPES type,
 			       ntfschar *name, u32 name_len, s64 *data_size);
 
 s64 ntfs_attr_mst_pread(struct ntfs_attr *na, const s64 pos,
-			       const s64 bk_cnt, const u32 bk_size, void *dst,
-			       bool warn_ov);
+			       const s64 bk_cnt, const u8 bk_size_bits,
+			       void *dst, bool warn_ov);
 s64 ntfs_attr_mst_pwrite(struct ntfs_attr *na, const s64 pos,
-				s64 bk_cnt, const u32 bk_size, void *src);
+				s64 bk_cnt, const u8 bk_size_bits, void *src);
 
 int ntfs_attr_map_runlist(struct ntfs_attr *na, VCN vcn);
 int ntfs_attr_map_whole_runlist(struct ntfs_attr *na);
@@ -338,6 +338,9 @@ int ntfs_attr_record_move_away(struct ntfs_attr_search_ctx *ctx, int extra);
 int ntfs_attr_update_mapping_pairs(struct ntfs_attr *na, VCN from_vcn);
 
 int ntfs_attr_truncate(struct ntfs_attr *na, const s64 newsize);
+
+int ntfs_attr_truncate_i(struct ntfs_attr *na, const s64 newsize,
+			 enum hole_type holes);
 
 int antfs_do_cluster_alloc(struct ntfs_inode *ni, struct ntfs_attr *na,
 				  VCN vcn, size_t count, LCN *res_lcn);

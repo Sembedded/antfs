@@ -45,7 +45,8 @@ extern struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 						  LCN start_lcn,
 						  const enum
 						  NTFS_CLUSTER_ALLOCATION_ZONES
-						  zone);
+						  zone,
+						  s64 file_size);
 
 extern int ntfs_cluster_free_from_rl(struct ntfs_volume *vol,
 				     struct runlist_element *rl);

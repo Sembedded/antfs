@@ -1,11 +1,15 @@
-#ifndef _FS_NTFSAVM_H
-#define _FS_NTFSAVM_H
+#ifndef _ANTFS_H
+#define _ANTFS_H
 
 #include <linux/version.h>
 #include <linux/err.h>
 
 #ifdef CONFIG_AVM_ENHANCED
+#if __has_include(<avm/sammel/debug.h>)
+#include <avm/sammel/debug.h>
+#else
 #include <linux/avm_debug.h>
+#endif
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
@@ -24,7 +28,8 @@ static inline long IS_ERR_OR_NULL(const void *ptr)
 #define ANTFS_LOGLEVEL_DBG	    6
 
 #ifndef CONFIG_AVM_ENHANCED
-#define avm_logger_printk_ratelimited(logger, fmt, ...)
+#define avm_logger_printk_ratelimited(logger, fmt, ...) \
+	no_printk(fmt, ##__VA_ARGS__)
 #endif
 
 /**
@@ -34,6 +39,9 @@ static inline long IS_ERR_OR_NULL(const void *ptr)
 #ifndef ANTFS_LOGLEVEL
 #	define ANTFS_LOGLEVEL	    ANTFS_LOGLEVEL_DEFAULT
 #endif
+
+
+extern struct _logger_priv *global_logger;
 
 #if (ANTFS_LOGLEVEL >= ANTFS_LOGLEVEL_ERR_EXT)
 #define antfs_pr_err(fmt, ...) pr_err(fmt, ##__VA_ARGS__)
@@ -77,7 +85,8 @@ static inline long IS_ERR_OR_NULL(const void *ptr)
 #define antfs_log_critical(fmt, ...) \
 	pr_err("[%s] <CRITICAL> " fmt "\n", __func__, ##__VA_ARGS__)
 #else
-#define antfs_log_critical(fmt, ...)
+#define antfs_log_critical(fmt, ...) \
+	no_printk("[%s] <CRITICAL> " fmt "\n", __func__, ##__VA_ARGS__)
 #endif
 #if (ANTFS_LOGLEVEL >= ANTFS_LOGLEVEL_ERR_EXT)
 #define antfs_log_error_ext(fmt, ...) \
@@ -91,27 +100,34 @@ static inline long IS_ERR_OR_NULL(const void *ptr)
 	antfs_pr_err("[%s] <ERROR> " fmt "\n", __func__, \
 			##__VA_ARGS__)
 #else
-#define antfs_log_error_ext(fmt, ...)
+#define antfs_log_error_ext(fmt, ...) \
+	no_printk("[%s] <ERROR> " fmt "\n", __func__,	\
+		  ##__VA_ARGS__)
 #endif
 #if (ANTFS_LOGLEVEL >= ANTFS_LOGLEVEL_ERR)
 #define antfs_log_error(fmt, ...) \
 	antfs_pr_err("[%s] <ERROR> " fmt "\n", __func__, \
-			##__VA_ARGS__)
+		     ##__VA_ARGS__)
 #else
-#define antfs_log_error(fmt, ...)
+#define antfs_log_error(fmt, ...) \
+	no_printk("[%s] <ERROR> " fmt "\n", __func__,	\
+		  ##__VA_ARGS__)
 #endif
 #if (ANTFS_LOGLEVEL >= ANTFS_LOGLEVEL_WARN)
 #define antfs_log_warning(fmt, ...) \
 	antfs_pr_warn("[%s] <WARNING> " fmt "\n", __func__, \
-			##__VA_ARGS__)
+		      ##__VA_ARGS__)
 #else
-#define antfs_log_warning(fmt, ...)
+#define antfs_log_warning(fmt, ...) \
+	no_printk("[%s] <WARNING> " fmt "\n", __func__,	\
+		  ##__VA_ARGS__)
 #endif
 #if (ANTFS_LOGLEVEL >= ANTFS_LOGLEVEL_INFO)
 #define antfs_log_info(fmt, ...) \
 	pr_info("[%s] <INFO> " fmt "\n", __func__, ##__VA_ARGS__)
 #else
-#define antfs_log_info(fmt, ...)
+#define antfs_log_info(fmt, ...) \
+	no_printk("[%s] <INFO> " fmt "\n", __func__, ##__VA_ARGS__)
 #endif
 #if (ANTFS_LOGLEVEL >= ANTFS_LOGLEVEL_DBG)
 #define antfs_log_debug(fmt, ...) \
@@ -119,29 +135,35 @@ static inline long IS_ERR_OR_NULL(const void *ptr)
 #define antfs_debug(fmt, ...)	\
 	pr_debug("[%s] <DEBUG> " fmt "\n", __func__, ##__VA_ARGS__)
 #else
-#define antfs_log_debug(fmt, ...)
-#define antfs_debug(fmt, ...)
+#define antfs_log_debug(fmt, ...) \
+	no_printk("[%s] <DEBUG> " fmt "\n", __func__, ##__VA_ARGS__)
+#define antfs_debug(fmt, ...) \
+	no_printk("[%s] <DEBUG> " fmt "\n", __func__, ##__VA_ARGS__)
 #endif
 #if (ANTFS_LOGLEVEL >= ANTFS_LOGLEVEL_DBG)
 #define antfs_log_enter(fmt, ...) \
 	pr_debug("[%s] (%pS) --> " fmt "\n", __func__,\
-	       __builtin_return_address(0), ##__VA_ARGS__)
+		 __builtin_return_address(0), ##__VA_ARGS__)
 #else
-#define antfs_log_enter(fmt, ...)
+#define antfs_log_enter(fmt, ...) \
+	no_printk("[%s] (%pS) --> " fmt "\n", __func__, \
+		  __builtin_return_address(0), ##__VA_ARGS__)
 #endif
 #if (ANTFS_LOGLEVEL >= ANTFS_LOGLEVEL_DBG)
 #define antfs_log_leave(fmt, ...) \
 	pr_debug("[%s] (%pS) <-- " fmt "\n\n", __func__,\
-	       __builtin_return_address(0), ##__VA_ARGS__)
+		 __builtin_return_address(0), ##__VA_ARGS__)
 #else
-#define antfs_log_leave(fmt, ...)
+#define antfs_log_leave(fmt, ...) \
+	no_printk("[%s] (%pS) <-- " fmt "\n\n", __func__, \
+		  __builtin_return_address(0), ##__VA_ARGS__)
 #endif
 
 /* macro that calls avm_logger_printk_ratelimited and antfs_log_critical */
-#define antfs_logger(logger, fmt, ...) \
+#define antfs_logger(sb_id, fmt, ...) \
 	do { \
-		avm_logger_printk_ratelimited(logger, "[%s] " fmt "\n", \
-			 __func__, ##__VA_ARGS__); \
+		avm_logger_printk_ratelimited(global_logger, "(%s)[%s] " fmt "\n", \
+			 sb_id, __func__, ##__VA_ARGS__); \
 		antfs_log_critical(fmt, ##__VA_ARGS__); \
 	} while (0)
 /*--- #define ANTFS_EARLY_BLALLOC ---*/
@@ -170,8 +192,10 @@ static inline long IS_ERR_OR_NULL(const void *ptr)
 #include "inode.h"
 #include "lcnalloc.h"
 
-/** Do not allocate MFT records smaller than 24. They are special... */
-#define RESERVED_MFT_RECORDS   24
+/** Do not allocate MFT records smaller than 32. Up to 24 are special inodes.
+ *  Keep the next 16 records free as a reserve for windows.
+ */
+#define RESERVED_MFT_RECORDS   32
 /** If we need to extend MFT $DATA, allocate 1 << this number of MFT records at
  *  once. This is to reduce MFT fragmentation.
  *
@@ -179,6 +203,11 @@ static inline long IS_ERR_OR_NULL(const void *ptr)
  *        @ntfs_mft_data_extend_allocation.
  */
 #define MFT_DATA_BURST_ALLOC_SHIFT   7
+
+/** leave a few clusters free, so windows can use them for chkdsk logs and
+ *  other stuff
+ */
+#define ANTFS_RESERVED_MEMORY (1<<21)
 
 #define IN_KERNEL_VERSION(a, b) ( \
 	(LINUX_VERSION_CODE >= KERNEL_VERSION(a, b, 0)) && \
@@ -214,13 +243,15 @@ struct antfs_dirent {
  * 0: Target of current operation
  * 1: parent inode
  * 2: another parent inode (e.g. for antfs_rename)
+ * 3: extent inode
  *
- * Locking order is normal -> parent -> parent2
+ * Locking order is normal -> parent -> parent2 -> extent
  */
 enum antfs_inode_mutex_lock_class {
 	NI_MUTEX_NORMAL,
 	NI_MUTEX_PARENT,
-	NI_MUTEX_PARENT2
+	NI_MUTEX_PARENT2,
+	NI_MUTEX_EXTENT
 };
 
 struct antfs_filler {
@@ -304,7 +335,7 @@ void antfs_inode_init_symlink(struct inode *inode);
 
 void antfs_parse_options(struct antfs_sb_info *sbi, char *data);
 
-int antfs_inode_init(struct inode *inode);
+int antfs_inode_init(struct inode **inode, enum antfs_inode_init_mode create);
 
 void antfs_sbi_destroy(struct antfs_sb_info *sbi);
 
@@ -331,4 +362,16 @@ static inline void set_nlink(struct inode *inode, unsigned int nlink)
 }
 #endif
 
-#endif /* _FS_NTFSAVM_H */
+static inline s64 antfs_reserved_clusters(struct ntfs_volume *vol)
+{
+	if (vol->cluster_size >= ANTFS_RESERVED_MEMORY)
+		return 1;
+	else
+		return ANTFS_RESERVED_MEMORY >> vol->cluster_size_bits;
+}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
+#define current_time(x)	(CURRENT_TIME_SEC)
+#endif
+
+#endif /* _ANTFS_H */

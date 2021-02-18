@@ -26,7 +26,7 @@
 #include "device.h"
 #include "misc.h"
 
-#define NTFSAVM_READAHEAD_SIZE		(16 * PAGE_SIZE)
+#define ANTFS_READAHEAD_SIZE		(16 * PAGE_SIZE)
 
 struct linux_io_dev_priv {
 	loff_t maxbytes;
@@ -82,7 +82,7 @@ static int ntfs_device_linux_io_open(struct ntfs_device *dev, int flags)
 	if ((flags & O_RDWR) != O_RDWR)
 		NDevSetReadOnly(dev);
 
-	/* TODO: NTFSAVM_SB_GET needs to change when
+	/* TODO: ANTFS_SB_GET needs to change when
 	 *	    no extra thread is created! */
 	priv = kzalloc(sizeof(struct linux_io_dev_priv), GFP_KERNEL);
 	if (!priv)
@@ -224,11 +224,12 @@ err:
 struct buffer_head *ntfs_load_bitmap_attr(struct ntfs_volume *vol,
 					  struct ntfs_attr *na, u64 bit)
 {
-	struct runlist_element *rl = na->rl;
+	struct runlist_element *rl;
 	LCN cn;
 	const int dbits =
 	    vol->cluster_size_bits - vol->dev->d_sb->s_blocksize_bits;
 	sector_t block = bit >> (vol->dev->d_sb->s_blocksize_bits + 3);
+	int ret;
 
 	/* Shift the diff to clusters. */
 	cn = block >> dbits;
@@ -237,7 +238,11 @@ struct buffer_head *ntfs_load_bitmap_attr(struct ntfs_volume *vol,
 	antfs_log_enter("bit(%llu) cn(%llu) nr_clusters(%lld)",
 			(unsigned long long)bit, (unsigned long long)cn,
 			(long long)vol->nr_clusters);
-	ntfs_attr_map_whole_runlist(na);	/* XXX: Needed? */
+	ret = ntfs_attr_map_whole_runlist(na);	/* XXX: Needed? */
+	if (ret)
+		return ERR_PTR(ret);
+
+	rl = na->rl;
 	/* XXX: This doesn't take the attribute size into account! */
 	/* Get LCN from runlist */
 	for (; cn >= rl->length; cn -= (rl++)->length) {
@@ -250,7 +255,7 @@ struct buffer_head *ntfs_load_bitmap_attr(struct ntfs_volume *vol,
 		}
 	}
 	if (rl->lcn < 0) {
-		antfs_log_debug("Unmapped/sparse cluster (%lld)!?", rl->lcn);
+		antfs_log_error("Unmapped/sparse cluster (%lld)!?", rl->lcn);
 		return ERR_PTR(-EIO);
 	}
 
@@ -277,7 +282,7 @@ struct buffer_head *ntfs_load_bitmap_attr(struct ntfs_volume *vol,
 static inline void antfs_readahead(struct super_block *sb, sector_t index,
 				   unsigned int reada_blks)
 {
-	int i;
+	unsigned int i;
 
 	for (i = 0; i < reada_blks; i++)
 		sb_breadahead(sb, index + i);
@@ -313,7 +318,7 @@ static s64 ntfs_device_linux_io_pread(struct ntfs_device *dev, void *buf,
 	index = data_addr >> blk_bits;
 	last_index = ((data_addr + data_size - 1) >> blk_bits) + 1;
 
-	blks_reada = NTFSAVM_READAHEAD_SIZE >> blk_bits;
+	blks_reada = ANTFS_READAHEAD_SIZE >> blk_bits;
 	blks_reada_half = blks_reada >> 1;
 	blk_curr = 0;
 
